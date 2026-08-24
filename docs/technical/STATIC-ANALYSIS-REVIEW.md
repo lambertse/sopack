@@ -355,10 +355,9 @@ signal short of measuring the artifact says PASS.
 **Two consequences worth carrying forward:**
 
 - **The same bug is in WBC's own `third_party/omvll/omvll_config.py`**, which means flattening has
-  never run on the white-box VM either. It is flagged in place on the `feat/omvll-as-input`
-  branch rather than corrected: turning four dormant passes on at once is a behaviour change with
-  recorded Register-Coalescer and anti-hooking hazards, and it belongs in its own change with its
-  own device run.
+  never run on the white-box VM either. It is **flagged in place rather than corrected**: turning
+  four dormant passes on at once is a behaviour change with recorded Register-Coalescer and
+  anti-hooking hazards, and it belongs in its own change with its own device run.
 - **This is why the obfuscation gate is structural.** The dead name is what produced the 712
   figure that hard-failed a real container build against an instruction floor — see the note at
   the end of this document. A numeric gate cannot separate "wrong plugin version" from "dead
@@ -368,6 +367,15 @@ signal short of measuring the artifact says PASS.
 `tests/test_obfuscate.py::test_omvll_configs_use_method_names_the_plugin_actually_dispatches`
 AST-walks both sopack config files against the known-valid method set, so a fifth dead name
 cannot be added silently.
+
+**Any bundle generated before this was fixed must be regenerated, including ones built after
+S3.** There is a window in which `MANIFEST.txt` reads `provider-obfuscation: omvll` and is wrong
+in exactly the way S3 described — the plugin reached sopack's code, but the pass that matters did
+not run. Two known local bundles fall in it: `artifacts/` (pre-review; S3 proper, the plugin
+never reached sopack's code at all) and any `out/bundle/` produced before the config fix. Neither
+is tracked, and no released bundle is affected, but the general rule holds: **a `MANIFEST.txt`
+predating the structural gate is not evidence of anything.** Only a bundle whose build printed
+`O-MVLL demonstrably ran (... outlined ...)` for both artifacts has been checked.
 
 ---
 

@@ -24,12 +24,16 @@ them in, so container runs afterwards need no network. The NDK dominates both th
 the resulting image size (a few GB unpacked).
 
 **The pre-warm is best-effort.** The image clones the submodule's repo at build time to bake
-those dependencies in, defaulting to `--build-arg WBC_REF=feat/linux-omvll` — the branch carrying
-Linux O-MVLL support. If that ref is not on the remote yet, the build **still succeeds**; it
-prints a note and the entrypoint fetches into the mounted submodule on the first run instead
-(~150 MB, once, and the container then needs network). Once the commit is pushed, rebuild with a
-SHA to bake it in — a branch name resolves to whatever its tip is at build time, which can drift
-from the submodule pin:
+libsodium in, defaulting to `--build-arg WBC_REF=master`. If the clone fails for any reason — no
+network at build time, the remote unreachable, a ref that does not exist — the build **still
+succeeds**; it prints a note and the entrypoint fetches into the mounted submodule on the first
+run instead (~150 MB, once, and the container then needs network).
+
+**For a reproducible image, pass the SHA rather than the branch.** `master` is a *moving* ref:
+today it resolves to exactly the submodule pin (check with `git submodule status`), but it
+resolves to whatever the tip is at build time, and the pre-warmed libsodium then comes from a
+tree that is not the one the pinned submodule expects. The fallback makes that recoverable, not
+invisible:
 
 ```bash
 docker build --platform linux/amd64 -f docker/Dockerfile --build-arg WBC_REF=<sha> -t sopack-bundler .

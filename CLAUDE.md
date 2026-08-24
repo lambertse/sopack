@@ -279,8 +279,9 @@ APKs. Do not merge them back, and do not reintroduce `assets/`.
   freestanding stub, `omvll_config_wb.py` for the wbaes skeletons). WBC keeps its own
   `omvll_config.py`, which names WBC's translation units and would match nothing of ours.
 - **`third_party/whitebox-cryptography/`** - the WBC dependency, a **tracked git submodule**
-  pinned to a commit (`b74317f`, branch `feat/omvll-as-input`, at time of writing) on
-  `lambertse/whitebox-cryptography`. The
+  pinned to a commit on `master` of `lambertse/whitebox-cryptography`. **Read the pin with
+  `git submodule status`, never from this file** - an earlier revision of this line named a SHA
+  two pins out of date, which is what a hand-copied SHA does. The
   only one of the four that is **source**, and the only one committed. It used to arrive out of
   band, which meant three scripts each guessed a different path and `MANIFEST.txt` recorded
   `wbc-rev: unknown` whenever the guess was not a readable git repo. Its *own* `third_party/`

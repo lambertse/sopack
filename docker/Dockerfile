@@ -132,17 +132,18 @@ ENV ANDROID_NDK_HOME=/opt/android-ndk-r29
 # arrives as a bind mount at run time and anything written here would be masked by it.
 # docker-entrypoint.sh seeds the mounted submodule from this staging copy.
 #
-# This layer is an OPTIMISATION and is deliberately BEST-EFFORT. It needs WBC_REF to exist on the
-# REMOTE, and while Linux O-MVLL support is new that ref may still be only on someone's laptop -
-# which must not make the image unbuildable, because the mounted checkout at run time already has
-# everything needed. So: pre-warm when we can, and leave a note when we cannot.
-# docker-entrypoint.sh checks /opt/wbc-deps and falls back to fetching into the mounted submodule
-# (which costs ~150 MB of network on the first run, and nothing after).
+# This layer is an OPTIMISATION and is deliberately BEST-EFFORT. It needs to reach the REMOTE at
+# build time, and a build host without network must not become a build host that cannot build the
+# image - the mounted checkout at run time already has everything needed. So: pre-warm when we
+# can, and leave a note when we cannot. docker-entrypoint.sh checks /opt/wbc-deps and falls back
+# to fetching into the mounted submodule (~150 MB of network on the first run, nothing after).
 #
-# Prefer passing a SHA (--build-arg WBC_REF=<sha>) matching the submodule pin once it is pushed:
-# a branch name resolves to whatever its tip is at build time, which can drift from the checkout.
+# WBC_REF defaults to master, which currently resolves to the submodule pin. Prefer passing the
+# SHA (--build-arg WBC_REF=<sha>) for a reproducible image: a branch name resolves to whatever
+# its tip is at build time, so this layer can silently bake a libsodium from a tree that is not
+# the pinned one. Read the pin with `git submodule status`.
 ARG WBC_REPO=https://github.com/lambertse/whitebox-cryptography
-ARG WBC_REF=feat/omvll-as-input
+ARG WBC_REF=master
 SHELL ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
 
 # ---- O-MVLL: fetched DIRECTLY, because sopack owns this pin now --------------------------
@@ -172,12 +173,12 @@ RUN mkdir -p /opt/wbc-deps; \
         echo "pre-warmed the whitebox-cryptography deps from $WBC_REF"; \
     else \
         rm -rf /opt/wbc-deps; mkdir -p /opt/wbc-deps; \
-        echo "NOTE: could not pre-warm libsodium from '$WBC_REF' in $WBC_REPO - the ref is"; \
-        echo "      probably not on the remote yet. The image is still usable: O-MVLL is"; \
-        echo "      already baked in above (sopack owns that pin), and"; \
-        echo "      the entrypoint will fetch libsodium into the mounted submodule on the"; \
-        echo "      first run. Rebuild with --build-arg WBC_REF=<sha>"; \
-        echo "      once the commit is pushed to bake them in."; \
+        echo "NOTE: could not pre-warm libsodium from '$WBC_REF' in $WBC_REPO - no network at"; \
+        echo "      build time, an unreachable remote, or a ref that does not exist there."; \
+        echo "      The image is still usable: O-MVLL is already baked in above (sopack owns"; \
+        echo "      that pin), and the entrypoint will fetch libsodium into the mounted"; \
+        echo "      submodule on the first run. To bake it in, rebuild with"; \
+        echo "      --build-arg WBC_REF=<sha> (see \`git submodule status\`)."; \
     fi; \
     rm -rf /tmp/wbc
 

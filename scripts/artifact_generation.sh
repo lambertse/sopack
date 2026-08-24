@@ -331,7 +331,13 @@ if [ "$PROVIDER_OBFUSCATION" = "omvll" ]; then
     OBF_RC=0
     OBF_OUT="$(NDK="$NDK" "$SOPACK/scripts/check_obfuscated.sh" --mode text "$SKEL" 2>&1)" || OBF_RC=$?
     case "$OBF_RC" in
-        0) ok "helper is demonstrably obfuscated ($OBF_OUT)" ;;
+        # "consistent with", not "demonstrably". This is the ADVISORY instruction-count check
+        # (check_obfuscated.sh --mode text): it cannot separate "1.9.1 with a working config"
+        # from "1.6.0 with a dead config method name" - the same source has read 613/712/1247/
+        # 2223. The authoritative, version-independent gate is --mode symbol in build_wbaes.sh,
+        # pre-strip. Do not let this message's tone get this check promoted back to a gate.
+        0) ok "helper size is consistent with obfuscation ($OBF_OUT; advisory - build_wbaes.sh's
+      pre-strip --mode symbol gate is the authoritative one)" ;;
         2) warn "could not verify obfuscation of the bundled artifacts:
       $OBF_OUT
       MANIFEST.txt will still record the flags this run was given." ;;
