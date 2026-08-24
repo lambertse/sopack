@@ -39,11 +39,31 @@ import omvll
 
 # sopack's own entry points, by symbol name. sopk_wb_k is the provider's single export;
 # the sopk_rt_* names are the thin helper's ctor and the routines it inlines.
+# Verified against the real unstripped artifacts rather than guessed from the source, because
+# two of the obvious names do not exist to match:
+#
+#   sopk_chacha20_apply, sopk_whiten_key   `static inline` in stub_cipher.h. At -O2 they are
+#                                          inlined into their callers and emit NO symbol, so
+#                                          naming them here would have matched nothing. They
+#                                          are still covered - as part of the function they
+#                                          were inlined into.
+#
+# Provider (libsopk_wb.so) has exactly one sopack symbol: sopk_wb_k (544 bytes).
+# Helper (sopk_rt_<abi>.so): sopk_rt_ctor (1704 B), self_cb (208), tgt_cb (144),
+#                            sopk_wipe (132), sopk_fail (20) - 613 .text instructions total.
 _TARGETS = {
-    "sopk_wb_k",          # provider: SRTW scan, passphrase de-whiten, wbc_open/unwrap
-    "sopk_rt_ctor",       # helper: the decrypt-and-place dance
-    "sopk_chacha20_apply",  # bulk .text cipher (shared by both)
-    "sopk_whiten_key",    # whitening-key derivation
+    # provider: SRTW scan, passphrase de-whitening, wbc_open/wbc_unwrap_key
+    "sopk_wb_k",
+    # helper: the decrypt-and-place dance. Inlines the ChaCha20 and the whitening-key
+    # derivation, and is 1704 of the helper's ~2452 .text bytes.
+    "sopk_rt_ctor",
+    # helper: the region magic-scan and the dl_iterate_phdr target lookup. Small, but they are
+    # the part that says HOW a helper finds its region and its target - i.e. the protocol.
+    "self_cb",
+    "tgt_cb",
+    # helper: key wipe. Worth obfuscating because its shape identifies where the session key
+    # lived a moment earlier.
+    "sopk_wipe",
 }
 
 # Rejected first, always. Mangling prefixes cover the C++ runtime the provider links in.

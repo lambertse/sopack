@@ -37,8 +37,20 @@
 # WHICH MODE FOR WHICH ARTIFACT
 #   thin helper  sopk_rt_<abi>.so  -> --mode text. Its .text is 100% sopack's code (it links no
 #                                    white-box at all), so whole-.text instruction count is a
-#                                    clean proxy AND survives stripping. Measured unobfuscated:
-#                                    613 instructions / 2452 bytes.
+#                                    clean proxy AND survives stripping.
+#
+#                                    BOTH SIDES MEASURED on real artifacts:
+#                                        plain        613 instructions
+#                                        obfuscated  1537 instructions   (2.5x)
+#
+#                                    Only 2.5x, not the 8-14x a single function shows, because
+#                                    much of the helper's .text is libc glue (__on_dlclose,
+#                                    atexit, pthread_atfork, __clear_cache) that the config
+#                                    correctly does not touch. The floor is 1000 - comfortably
+#                                    above plain, comfortably below obfuscated. An earlier
+#                                    version guessed 1500 from the plain side alone, which the
+#                                    real obfuscated build clears by 37 instructions; that would
+#                                    have hard-failed builds on any pass-set change.
 #   provider     libsopk_wb.so     -> --mode symbol, BEFORE stripping. Its .text is 75,602
 #                                    instructions, almost all vendored libwbcrypto, so whole-
 #                                    .text would drown sopk_wb_k's 136 entirely.
@@ -78,7 +90,7 @@ READELF="$(find_tool readelf || true)"
        NOT 'obfuscated' - do not record a claim you could not check." >&2; exit 2; }
 
 if [ "$MODE" = "text" ]; then
-    : "${MIN:=1500}"   # 2.4x the measured plain 613; obfuscation grows this ~8-14x
+    : "${MIN:=1000}"   # between the measured 613 (plain) and 1537 (obfuscated)
     OBJDUMP="$(find_tool objdump || true)"
     [ -n "$OBJDUMP" ] || { echo "cannot verify obfuscation: no objdump available (unknown)." >&2; exit 2; }
     INSNS="$("$OBJDUMP" -d --section=.text "$TARGET" 2>/dev/null | grep -cE '^[[:space:]]*[0-9a-f]+:' || true)"
@@ -87,7 +99,7 @@ if [ "$MODE" = "text" ]; then
     if [ "$INSNS" -lt "$MIN" ]; then
         echo "$(basename "$TARGET") has $INSNS .text instructions (floor $MIN) - UNOBFUSCATED.
        Its .text is entirely sopack's own code, so this is a direct measurement, not a proxy.
-       An unobfuscated thin helper measures 613; obfuscation grows it several times over.
+       Measured on real artifacts: 613 instructions plain, 1537 obfuscated.
        Check that scripts/fetch_omvll.sh vendored a plugin, that stub/omvll_config_wb.py
        exists, and that the plugin actually LOADED - clang reports an unloadable pass-plugin
        once per translation unit, so the real error hides in the wall of output." >&2

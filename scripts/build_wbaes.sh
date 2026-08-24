@@ -791,11 +791,25 @@ if [ "$OMVLL" -eq 1 ]; then
     OBF_RC=0
     OBF_OUT="$(NDK="$NDK" "$SOPACK/scripts/check_obfuscated.sh" --mode text "$SKEL" 2>&1)" \
         || OBF_RC=$?
+    # WARN, not die, and the asymmetry with the provider check above is deliberate.
+    #
+    # The provider gate (--mode symbol) is calibrated against both sides with a wide margin:
+    # 256 bytes plain vs 1820 obfuscated, floor 600. The helper gate (--mode text) has a much
+    # narrower one - 613 plain vs 1537 obfuscated, floor 1000 - because most of the helper's
+    # .text is libc glue the config correctly leaves alone, so obfuscation only moves the total
+    # 2.5x. Those numbers were measured with O-MVLL 1.6.0; the shipping pin is 1.9.1, and a
+    # different pass set could land lower.
+    #
+    # A threshold that blocks every build on a pass-set change is worse than one that reports.
+    # artifact_generation.sh keeps this FATAL, because that is where the claim gets written into
+    # MANIFEST.txt and shipped - the failure that actually matters.
     case "$OBF_RC" in
         0) ok "thin helper: O-MVLL demonstrably ran ($OBF_OUT)" ;;
         2) warn "thin helper: could not verify whether O-MVLL ran:
       $OBF_OUT" ;;
-        *) die "$OBF_OUT" ;;
+        *) warn "thin helper does not look obfuscated:
+      $OBF_OUT
+      Not fatal here - artifact_generation.sh refuses it when building a bundle." ;;
     esac
 fi
 

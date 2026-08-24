@@ -182,7 +182,7 @@ RUN mkdir -p /opt/wbc-deps; \
     rm -rf /tmp/wbc
 
 WORKDIR /workspace
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--tar"]
