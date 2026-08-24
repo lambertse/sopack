@@ -48,9 +48,12 @@ pip install -e .                            # install the CLI (pulls in LIEF + P
 # refuses $ZIG_BIN/$EXTRA_CXXFLAGS so no cross toolchain or O-MVLL plugin can leak into a
 # PROVISIONING tool. Upstream's own header calls build-host/wb_keygen "part of the consumer
 # contract" with this repo, by name. Do not switch it to build_host.sh.
-# NEEDS NETWORK on the first run: WBC's third_party/fetch_deps.sh downloads libsodium (and the
-# O-MVLL release) as SHA256-pinned tarballs. They are not submodules - WBC has no nested ones,
-# so `git submodule update --init` takes no --recursive.
+# NEEDS NETWORK on the first run: WBC's third_party/fetch_deps.sh downloads libsodium as a
+# SHA256-pinned tarball, and scripts/fetch_omvll.sh downloads the O-MVLL release. O-MVLL is NO
+# LONGER WBC's - sopack owns that pin and passes the plugin in via `build_android.sh
+# --omvll-plugin/--omvll-pythonpath`; WBC keeps a copy of the pin purely as a standalone-dev
+# fallback, and build_wbaes.sh warns if the two have drifted. Neither is a submodule - WBC has
+# no nested ones, so `git submodule update --init` takes no --recursive.
 # NDK from the environment, else --ndk, else prompts. SOPACK is always the repo the script
 # lives in. --force redoes cached phases; --help lists everything.
 
@@ -58,8 +61,25 @@ pip install -e .                            # install the CLI (pulls in LIEF + P
 # Uses the NDK if ANDROID_NDK_HOME/ANDROID_NDK_ROOT is set, else clang+lld+llvm-* on PATH.
 # Hard-fails if the blob has any relocation, undefined symbol, or (arm64) adrp.
 bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.bin + *.json
+bash stub/build_stubs.sh --with-log         # ...WITH logcat support compiled in. OFF by default:
+                                            #   a logging stub ships all 14 staged messages and
+                                            #   /dev/socket/logdw in EVERY packed library (they
+                                            #   used to be gated only at runtime, which `strings`
+                                            #   ignores). Off also shrinks arm64 6713 -> 2256 B.
+                                            #   `logging.stub-log: true` REQUIRES a --with-log
+                                            #   stub; the packer refuses the mismatch.
+./scripts/fetch_omvll.sh                    # vendor the O-MVLL plugin + its version-locked
+                                            #   CPython 3.10 stdlib into third_party/omvll/.
+                                            #   SOPACK owns this pin now (not the WBC submodule):
+                                            #   a pass-plugin only loads into the clang it was
+                                            #   built against, and sopack owns the NDK pin.
+./scripts/check_obfuscated.sh --mode text  sopack/stubs/sopk_rt_<abi>.so
+./scripts/check_obfuscated.sh --mode symbol <provider.so>   # PRE-strip only
+                                            #   Decides FROM THE ARTIFACT whether O-MVLL ran on
+                                            #   sopack's own code. Exit 2 = "cannot tell", which
+                                            #   is never a pass.
 
-# Harness scripts (see "Directory layout" below for how these four directories differ)
+# Harness scripts (see "Directory layout" below for how these directories differ)
 ./scripts/device_test.sh [--only PAT]       # pack every test_apks/*.apk with wbaes, install and
                                             #   launch each on a device, and assert
                                             #   decrypted-library COUNT == injected COUNT. Builds
@@ -85,6 +105,18 @@ sopack init-config [-o PATH]                # write a commented config.yaml ('-'
 # unedited config packs exactly like no config.
 #
 # The schema, and what each key replaced:
+#   obfuscate: false                  recompile a freshly-seeded, O-MVLL-obfuscated stub for
+#                                     EVERY pack, so no two apps ship the same one. STUB CIPHERS
+#                                     ONLY - `obfuscate: true` with `cipher: wbaes` is an ERROR,
+#                                     not a no-op (wbaes injects no stub). This is what makes
+#                                     chacha20 defensible: the prebuilt stub is byte-identical in
+#                                     every app, so its whitening key is a PRECOMPUTABLE CONSTANT
+#                                     and a universal unpacker needs no reverse engineering at
+#                                     all. Seeded, two packs differ in ~89% of stub bytes and each
+#                                     app gets its own key (measured). Off by default: it needs
+#                                     the NDK + the O-MVLL plugin AT PACK TIME, which breaks the
+#                                     prebuilt-blob model and slows packs. The seed lands in
+#                                     report.json.
 #   cipher: wbaes                     DEFAULTS TO wbaes, the white-box AES-128 KEY-WRAP mode
 #                                     (see "wbaes mode" below): the long-term key is sealed into
 #                                     a white-box blob and never reconstructed at runtime, so no
@@ -197,6 +229,10 @@ python -m pytest tests/test_diag.py         # the host log: rotation, retention,
                                            #   concurrent index appends, run-id sanitisation
 python -m pytest tests/test_exitcodes.py    # the exception->code map + the 8-bit subprocess check
 python -m pytest tests/test_report.py       # report.json / index.jsonl shape and the schema
+python -m pytest tests/test_obfuscate.py    # the polymorphic stub: config surface always, and
+                                           #   (marked `slow`, skipped without the NDK+O-MVLL)
+                                           #   that TWO SEEDS PRODUCE DIFFERENT WHITENING KEYS -
+                                           #   the one property that kills the universal unpacker
 python -m pytest tests/test_integration.py -k init_array   # a single test by name
 ```
 
@@ -209,7 +245,7 @@ a usable stand-in once "is this an APK?" became a question the packer asks. It d
 fixtures** - `test_exitcodes.py` and `test_diag.py` own their `diag`-state teardown per module, and
 an autouse fixture in a conftest would silently change the isolation regime of every other file.
 
-## Directory layout (one tracked dependency + three gitignored)
+## Directory layout (one tracked dependency + four gitignored)
 
 They look interchangeable and are not - one is the dependency SOURCE, one is test input, one
 holds build OUTPUTS of that source, one is the shippable output. Three of them were a single
@@ -217,8 +253,16 @@ holds build OUTPUTS of that source, one is the shippable output. Three of them w
 directory*, so it read as "files bundled into the APK" in a tool whose whole job is unpacking
 APKs. Do not merge them back, and do not reintroduce `assets/`.
 
+- **`third_party/omvll/`** - the O-MVLL pass-plugin + its version-locked CPython 3.10 stdlib,
+  fetched by `scripts/fetch_omvll.sh`. **Gitignored** (~65-95 MB, and not ours to redistribute).
+  OURS, not the submodule's: a pass-plugin only loads into the clang it was built against, so its
+  pin moves with the NDK pin and the NDK pin is ours. The hand-authored O-MVLL POLICY files are
+  NOT here - they live in `stub/` beside the sources they name (`omvll_config.py` for the
+  freestanding stub, `omvll_config_wb.py` for the wbaes skeletons). WBC keeps its own
+  `omvll_config.py`, which names WBC's translation units and would match nothing of ours.
 - **`third_party/whitebox-cryptography/`** - the WBC dependency, a **tracked git submodule**
-  pinned to a commit (`8a3c941` at time of writing) on `lambertse/whitebox-cryptography`. The
+  pinned to a commit (`b74317f`, branch `feat/omvll-as-input`, at time of writing) on
+  `lambertse/whitebox-cryptography`. The
   only one of the four that is **source**, and the only one committed. It used to arrive out of
   band, which meant three scripts each guessed a different path and `MANIFEST.txt` recorded
   `wbc-rev: unknown` whenever the guess was not a readable git repo. Its *own* `third_party/`
@@ -492,7 +536,13 @@ Pieces:
 
 Only `arm64-v8a` is protected in practice, by deliberate scope choice - and since the `abis:`
 default is now `stubs.DEFAULT_ABIS = ("arm64-v8a",)`, that is also what the tool does unless the
-user sets `abis: all`. The other ABIs ship cleartext `.text`, so an analyst after the *algorithm*
+user sets `abis: all`. **Under a STATIC-analysis threat model this is not a coverage gap, it is a
+bypass**: on the repo's own `output/vsa-encrypted.apk`, 20 of 21 protected libraries also ship an
+unencrypted, source-equivalent build one directory over IN THE SAME APK, so an analyst reads that
+instead for the cost of one `unzip`. sopack does not close this (that is the operator's call) but
+it now MEASURES it - `apk.find_cross_abi_cleartext` feeds a `BYPASS:` block in the CLI summary and
+a `cross_abi_cleartext` array in `report.json`. See
+[`docs/technical/STATIC-ANALYSIS-REVIEW.md`](./docs/technical/STATIC-ANALYSIS-REVIEW.md) S1. The other ABIs ship cleartext `.text`, so an analyst after the *algorithm*
 reads the x86_64 build and never touches the encryption. State the value accordingly: this raises
 device-level attack cost on arm64; it does not keep algorithms secret. The CLI's per-ABI summary
 exists to keep that visible rather than letting a bare "Injected N libraries" imply full coverage.
@@ -844,10 +894,13 @@ two things that were actually macOS-specific have both been fixed rather than wo
   the macOS `otool` allow-list, not a weaker one. Do not make it a warning: "cannot tell" is not
   "static", and the failure it prevents (`version GLIBC_2.xx not found`) surfaces at first pack on
   the machine with no toolchain.
-- O-MVLL used to be macOS-only here because the submodule pinned only the Mach-O release. It now
-  pins the **Linux x86_64** plugin too (`omvll_ndk_r29.so`), chosen by `omvll_plugin_path` in
-  `fetch_deps.sh` - one definition, sourced by `build_android.sh`. The plugin is built against
-  **NDK r29**'s clang and loads into nothing else, so the NDK and O-MVLL pins move together.
+- O-MVLL used to be macOS-only here, then WBC gained the Linux `.so`. It is now **sopack's**
+  (`scripts/fetch_omvll.sh` -> `third_party/omvll/`), for the reason that coupling implies: the
+  plugin is built against **NDK r29**'s clang and loads into nothing else, so the NDK and O-MVLL
+  pins move together - and the NDK pin is sopack's (`docker/Dockerfile`). One repo owning half of
+  a coupled pair is how they drift. The plugin is applied to the vendored `libwbcrypto.a` AND to
+  sopack's own `sopk_wb.c`/`sopk_rt.c`; it used to reach only the former while `MANIFEST.txt`
+  claimed otherwise. `scripts/check_obfuscated.sh` now verifies that from the artifact.
 
 `docker/` builds the Linux bundle in a `linux/amd64` image; see `docker/README.md`. Not a
 preference: Google publishes no `linux-aarch64` NDK toolchain and the O-MVLL Linux plugin is
