@@ -291,14 +291,21 @@ def run_warnings() -> list[str]:
 
 
 # ---- run lifecycle -----------------------------------------------------------------------
+_RUN_DIR_ATTEMPTS = 4      # see open_run; 4 x 32-bit misses is not chance
 def _run_id(input_apk: str) -> str:
-    """`YYYYmmdd-HHMMSS-<4 hex>-<stem>`, UTC so it sorts chronologically.
+    """`YYYYmmdd-HHMMSS-<8 hex>-<stem>`, UTC so it sorts chronologically.
 
     The random suffix is not decoration: concurrent packs started in the same second would
     otherwise collide on the directory name and interleave two runs' logs into one file.
+
+    FOUR bytes, not two. Two gives 65,536 values, and a batch of 50 same-second packs then
+    collides with probability ~1.9% (birthday, not 50/65536) - that is a customer losing a run
+    record roughly every other large batch, and it is frequent enough that it showed up as a
+    "flaky" unit test before it showed up as a lost log. The salt is only ever probabilistic,
+    though, so `open_run` does NOT rely on it alone; see the retry there.
     """
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-    salt = os.urandom(2).hex()
+    salt = os.urandom(4).hex()
     stem = os.path.basename(input_apk or "no-input")
     # Both container extensions, or an `app.aab` run lands in a directory named `…-app_aab`
     # (the dot is not run-id-safe, so _UNSAFE would rewrite it rather than drop it).
@@ -336,8 +343,29 @@ def open_run(cfg_file, input_apk: str) -> str:
 
     run_dir = None
     try:
-        run_dir = os.path.join(root, "runs", run_id)
-        os.makedirs(run_dir, exist_ok=True)
+        runs_root = os.path.join(root, "runs")
+        # NOT exist_ok=True. The salt makes a same-second collision unlikely, never impossible,
+        # and sharing a directory is exactly the failure it exists to prevent: two runs interleave
+        # into one run.log and the second report.json overwrites the first. exist_ok suppressed
+        # the one signal that would have shown it. Let makedirs raise on a name already taken and
+        # re-roll instead - that turns a probability into an actual guarantee, which matters
+        # because a batch is precisely where concurrent same-second packs happen.
+        for _ in range(_RUN_DIR_ATTEMPTS):
+            run_dir = os.path.join(runs_root, run_id)
+            try:
+                os.makedirs(run_dir)
+                break
+            except FileExistsError:
+                run_id = _run_id(input_apk)
+        else:
+            # Four independent 32-bit collisions is not chance - it is a pre-seeded tree or a
+            # broken RNG. Share the directory rather than lose the run's log entirely, and say so:
+            # the interleaving this causes is confusing enough to be worth a line in the log.
+            run_dir = os.path.join(runs_root, run_id)
+            os.makedirs(run_dir, exist_ok=True)
+            logger().warning(f"WARNING: could not find a free run directory under {runs_root} "
+                             f"after {_RUN_DIR_ATTEMPTS} attempts; reusing {run_id}. Its log and "
+                             f"report may interleave with another run's.")
         _install_file_handlers(root, run_dir, cfg_file)
     except OSError as e:
         run_dir = None

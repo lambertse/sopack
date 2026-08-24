@@ -638,6 +638,16 @@ pack many APKs repeatedly - so a single overwritten file would preserve one run 
 other 39, and a batch is exactly where "three of these failed and I don't know which" happens. A
 run's `run.log` and `report.json` are created and pruned **together**, so they cannot disagree.
 
+**A run directory is never shared, and the salt is not what guarantees that.** The run id is
+`YYYYmmdd-HHMMSS-<8 hex>-<stem>` (UTC first, because `report._prune_runs` picks the oldest by
+sorting NAMES - nothing reads an mtime). The salt only makes a same-second collision *unlikely*;
+`open_run` makes it impossible, by calling `os.makedirs` **without `exist_ok`** and re-rolling the
+id on `FileExistsError`. Do not "simplify" that back to `exist_ok=True`: two runs sharing a
+directory interleave one `run.log` and let the second `report.json` overwrite the first, and
+`exist_ok` suppresses the only signal that it happened. The salt was **two** bytes until a 1.6%
+unit-test flake was read correctly - the same 1.6% was a 50-APK batch silently losing a run
+record, which is the exact failure per-run records exist to prevent.
+
 **Exit code = status class ONLY; the count lives in the record.** `0` ok, `1` internal, `2` usage,
 `3` config, `4` input, `5` selection, `6` nothing-encrypted, `7` toolchain, `8` inject, `9` signing,
 `10` output. Three properties are deliberate and were the reason the originally-proposed encoding
