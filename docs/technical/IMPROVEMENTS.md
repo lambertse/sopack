@@ -159,5 +159,22 @@ Note `cipher: wbaes` on x86_64 also needs a provider built for that ABI. Since i
 shipped there is one KEK per **(pack, ABI)**, so that provider must be sealed with its own key and
 must **not** share arm64's long-term key.
 
-**Measurement that would justify it.** Not a measurement: a decision about whether the emulator
-and x86_64-device install base matters for the app being packed.
+**Measurement that would justify it.** ~~A decision about whether the emulator and x86_64-device
+install base matters for the app being packed.~~ **That framing was wrong, and is why this stayed
+open.** The exposure has nothing to do with who *runs* x86_64: under a static-analysis threat
+model the cleartext copy is in the shipped file regardless of what executes it, and an analyst
+never runs anything. It is not a coverage gap, it is a **bypass** - the analyst opens
+`lib/armeabi-v7a/` in the same container and reads a symbol-bearing, source-equivalent build of
+the code the arm64 encryption was protecting, for the cost of one `unzip`.
+
+Measured on this repo's own `output/vsa-encrypted.apk`: **20 of 21** protected libraries have a
+cleartext counterpart in the same APK, including `libpki`, `libzfcrypto`, `libsecurefileio` and
+`libidliveface`. See [`STATIC-ANALYSIS-REVIEW.md`](./STATIC-ANALYSIS-REVIEW.md) S1.
+
+**Current status: accepted risk, reported not closed.** Closing it means a per-ABI provider and
+KEK plus fixing the stub path's unconditional 16 KB check
+([`PAGE-ALIGNMENT.md`](./PAGE-ALIGNMENT.md) §7) - or dropping the unprotected ABIs from the
+container, which is equally effective against a static analyst and much cheaper. Both are the
+operator's call, not the packer's. What sopack does now is **measure** it on every pack:
+`apk.find_cross_abi_cleartext()` feeds a `BYPASS:` block in the CLI summary and a
+`cross_abi_cleartext` array in `report.json`.

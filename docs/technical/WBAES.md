@@ -302,9 +302,12 @@ export WBC="$SOPACK/third_party/whitebox-cryptography"
 
 Set `WBC` to somewhere else only to build against a working copy of the SDK; the submodule is
 the pinned revision every artifact and every `MANIFEST.txt` is expected to name. WBC's *own*
-`third_party/` (libsodium, the O-MVLL plugin, a CPython stdlib) is fetched by its
-`third_party/fetch_deps.sh` as SHA256-pinned tarballs, which its build scripts run for you -
-so the first build needs **network**, and there is nothing to `git submodule` recursively.
+`third_party/` (libsodium, and a CPython stdlib only as its standalone fallback) is fetched by
+its `third_party/fetch_deps.sh` as SHA256-pinned tarballs. **The O-MVLL plugin is no longer
+WBC's**: sopack owns that pin (`scripts/fetch_omvll.sh` -> `third_party/omvll/`) and passes it in
+via `build_android.sh --omvll-plugin`, because a pass-plugin only loads into the clang it was
+built against and sopack owns the NDK pin. Either way the first build needs **network**, and
+there is nothing to `git submodule` recursively.
 
 ---
 

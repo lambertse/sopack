@@ -27,6 +27,11 @@ With `cipher: wbaes` you additionally get **no portable key in the binary at all
 long-term AES key is sealed into a white-box and never reconstructed at runtime. See the
 ceiling below for what that does and does not buy.
 
+> An empirical review of these defences against real shipped artifacts is in
+> [`technical/STATIC-ANALYSIS-REVIEW.md`](./technical/STATIC-ANALYSIS-REVIEW.md). Read it
+> alongside this page: it found that with the default `abis:` setting, 20 of 21 protected
+> libraries also shipped **unencrypted** under another ABI in the same APK.
+
 ## Threat model, and the honest ceiling
 
 - **In scope (what these techniques raise the cost of):** a *static* analyst reading the

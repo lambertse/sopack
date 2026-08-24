@@ -143,8 +143,11 @@ resolve_wbc() {
         # checkout". Test for the header, and initialise when it is missing.
         if [ ! -f "$sub/include/wbcrypto.h" ] && [ -f "$sopack/.gitmodules" ]; then
             say "initialising the whitebox-cryptography submodule (pinned)"
-            # No --recursive: WBC has no nested submodules. Its own third_party/ (libsodium,
-            # O-MVLL) is a SHA256-pinned tarball fetch that its build scripts run themselves.
+            # No --recursive: WBC has no nested submodules. Its own third_party/ (libsodium)
+            # is a SHA256-pinned tarball fetch that its build scripts run themselves. O-MVLL
+            # is no longer among them - sopack owns that pin (scripts/fetch_omvll.sh) and
+            # passes the plugin in, because it only loads into the clang it was built against
+            # and sopack owns the NDK pin.
             ( cd "$sopack" && git submodule update --init "$WBC_SUBMODULE" ) \
                 || die "git submodule update --init $WBC_SUBMODULE failed. It needs network the
        first time. To use a checkout you already have, pass --wbc PATH or export WBC."

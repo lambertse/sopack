@@ -275,6 +275,11 @@ bundle. Two Linux-specific notes:
   [`docker/README.md`](../docker/README.md) has a `linux/amd64` image that does the whole thing
   with a pinned NDK r29.
 
+O-MVLL itself is vendored by `scripts/fetch_omvll.sh` into `third_party/omvll/` (sopack owns
+that pin; the submodule keeps a copy only as its standalone fallback) and is applied to BOTH the
+vendored `libwbcrypto.a` and sopack's own `sopk_wb.c`/`sopk_rt.c`. `scripts/check_obfuscated.sh`
+then verifies from the artifact that it actually ran.
+
 `--allow-unobfuscated-provider` builds `libsopk_wb.so` without O-MVLL. It is never implied — not
 by the host, not by a plugin that failed to load — and it is recorded as
 `provider-obfuscation: none` in `MANIFEST.txt`, which `install.sh` warns about, because "it

@@ -13,14 +13,27 @@ SELinux `avc` denial, and neither `SOPK` nor `sopack` appears in the shipped lib
 
 | # | Technique | Status | Effect on a static analyst |
 | - | --------- | ------ | -------------------------- |
-| 1 | [Whiten the metadata record](#method-1--whiten-the-metadata-record-with-a-self-derived-key) with a key derived from the stub's own code | ✅ shipped (device-confirmed) | No key/magic in the file; recovery now requires reversing the stub |
+| 1 | [Whiten the metadata record](#method-1--whiten-the-metadata-record-with-a-self-derived-key) with a key derived from the stub's own code | ⚠️ shipped, but **weaker than it reads** | Key/nonce masked at rest — real. But it REPLACES the `SOPK` needle with a different fixed one, and the de-whitening key is a build constant, so recovery needs no reversing at all. See [S2](./STATIC-ANALYSIS-REVIEW.md) |
 | 2 | [No magic at rest](#method-2--no-magic-at-rest-patch-by-known-offset-not-by-scanning) - patch by known offset, verify the signpost is gone | ✅ shipped | Nothing to `grep` for; a pack-time guard proves it |
 | 3 | [Section-header stripping](#method-3--section-header-stripping--researched-rejected-removed) | ❌ removed | Incompatible with Android 14+ bionic; also low value once (1) holds |
 | 4 | [String hygiene](#method-4--string-hygiene-drop-the-packers-name) - obfuscate the `sopack` tag | ✅ shipped | Packer name absent from a `strings` dump |
 | 5 | [Strip the wbaes helper](#method-5--strip-the-wbaes-helper-symbols-dwarf-host-paths) - symbols, DWARF, host paths | ✅ shipped (host-verified) | Removes the single largest shortcut: named functions and the SDK's whole API |
+| 6 | **O-MVLL on sopack's own code** (`stub/omvll_config_wb.py`) | ✅ shipped | Was the single biggest hole: `--omvll` reached only the vendored `libwbcrypto.a`, while `MANIFEST.txt` claimed the provider was obfuscated |
+| 7 | **A mechanical obfuscation gate** (`scripts/check_obfuscated.sh`) | ✅ shipped | Measures the artifact, so the manifest's claim cannot silently be false. Exit 2 = "cannot tell", never a pass |
+| 8 | **ZIP timestamp normalisation** of added entries | ✅ shipped | A 1980-01-01 outlier was the *first* thing an external report noticed, before any disassembly |
+| 9 | **No KEK/session key in the output** (`_self_verify_wbaes`) | ✅ shipped | Byte-scans the written artifact for material that must never leave the host |
+| 10 | **Cross-ABI cleartext reporting** (`apk.find_cross_abi_cleartext`) | ✅ shipped (reporting only) | Does not close [S1](./STATIC-ANALYSIS-REVIEW.md) — measures it. 20 of 21 protected libraries had a cleartext counterpart in the same APK |
+
+Items 6–10 were shipped hardening that this table did not list; 8 and 9 predate the review and
+were documented only in `BUILDING.md`/`WBAES.md`/`ARCHITECTURE.md`. A hardening table that is not
+the full inventory invites re-solving what is already solved, and hides what is not.
 
 The contract version was bumped `SOPK_VERSION` 1 → 2 (`stub/decinfo.h` ⇄ `sopack/metadata.py`);
 the 128-byte layout is unchanged - only its at-rest *representation* is whitened.
+
+> **See also** [`STATIC-ANALYSIS-REVIEW.md`](./STATIC-ANALYSIS-REVIEW.md) — an empirical review
+> against real shipped artifacts, which found three issues that bypass the crypto rather than
+> break it, and one control that reported itself present while absent.
 
 ## Threat model, and the honest ceiling
 
