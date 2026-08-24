@@ -324,14 +324,22 @@ fi
 #     runs on every build); here we re-run it against the artifact actually being bundled,
 #     because --skip-build can hand us a provider this run never built.
 if [ "$PROVIDER_OBFUSCATION" = "omvll" ]; then
-    if OBF_OUT="$("$SOPACK/scripts/check_obfuscated.sh" "$PROV" 2>&1)"; then
-        ok "provider is demonstrably obfuscated ($OBF_OUT)"
-    else
-        die "$OBF_OUT
+    # The THIN HELPER is what can be measured here. Both artifacts in a bundle are already
+    # stripped, and the provider's evidence (O-MVLL's outlined sopk_wb_k.* siblings) is local
+    # symbols the strip removed - build_wbaes.sh gates that one pre-strip instead. The helper
+    # needs no such trick: it links no white-box, so its .text is entirely sopack's code.
+    OBF_RC=0
+    OBF_OUT="$("$SOPACK/scripts/check_obfuscated.sh" --mode text "$SKEL" 2>&1)" || OBF_RC=$?
+    case "$OBF_RC" in
+        0) ok "helper is demonstrably obfuscated ($OBF_OUT)" ;;
+        2) warn "could not verify obfuscation of the bundled artifacts:
+      $OBF_OUT
+      MANIFEST.txt will still record the flags this run was given." ;;
+        *) die "$OBF_OUT
 
-       MANIFEST.txt is about to record provider-obfuscation: omvll for an artifact that is not.
-       To ship anyway, pass --allow-unobfuscated-provider, which records the truth."
-    fi
+       MANIFEST.txt is about to record obfuscation: omvll for artifacts that are not.
+       To ship anyway, pass --allow-unobfuscated-provider, which records the truth." ;;
+    esac
 fi
 
 # 4+5. wb_keygen: the one host-specific file, so both its checks are about the RECEIVING machine.

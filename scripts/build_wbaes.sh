@@ -507,8 +507,20 @@ else
        against ($(ldd --version | head -1)); build on a newer base - docker/Dockerfile uses
        ubuntu:24.04 for exactly this. Otherwise pass --no-omvll (and, for a bundle,
        --allow-unobfuscated-provider) to build without obfuscation." ;;
+            # "not a dynamic executable" means ldd could not analyse it AT ALL - which on this
+            # path means a foreign-arch plugin (an aarch64 ldd handed the x86_64 .so, i.e. an
+            # emulated host). Reporting OK there is a FALSE reassurance of exactly the kind this
+            # check exists to prevent: the glibc floor is still live and clang will hit it.
+            *"not a dynamic executable"*)
+                warn "ldd cannot analyse $OMVLL_PLUGIN on this host - it is a foreign-arch
+      binary here, so the usual glibc-floor preflight cannot run. If clang reports
+      \"version \`GLIBC_2.38' not found\" the base image is too old; docker/ uses ubuntu:24.04
+      for exactly that." ;;
         esac
-        ok "the O-MVLL plugin's dynamic dependencies resolve on this host"
+        case "$LDD_OUT" in
+            *"not a dynamic executable"*) ;;
+            *) ok "the O-MVLL plugin's dynamic dependencies resolve on this host" ;;
+        esac
     fi
 
     info "cross-building the runtime library (${OMVLL_ARG:---omvll}) …"
@@ -651,6 +663,22 @@ if ! link_provider -static-libstdc++; then
         die "provider link failed (log above)"
     fi
 fi
+# Obfuscation gate for the PROVIDER, and it must run HERE - before the strip. O-MVLL outlines
+# sopk_wb_k's body into local siblings (sopk_wb_k.1, ...), and --strip-all deletes local
+# symbols, so after this line the evidence is gone. Measuring the provider's whole .text is no
+# substitute: 75,602 of its ~75,738 instructions are vendored libwbcrypto.
+if [ "$OMVLL" -eq 1 ]; then
+    OBF_RC=0
+    OBF_OUT="$(NDK="$NDK" "$SOPACK/scripts/check_obfuscated.sh" --mode symbol "$PROV" 2>&1)" \
+        || OBF_RC=$?
+    case "$OBF_RC" in
+        0) ok "provider: O-MVLL demonstrably ran on sopack's own code ($OBF_OUT)" ;;
+        2) warn "provider: could not verify whether O-MVLL ran on sopack's own code:
+      $OBF_OUT" ;;
+        *) die "$OBF_OUT" ;;
+    esac
+fi
+
 "$NDKBIN/llvm-strip" --strip-all "$PROV" 2>/dev/null || true
 ok "provider: $(basename "$PROV") ($(wc -c <"$PROV" | tr -d ' ') bytes)"
 
@@ -754,18 +782,18 @@ if [ -n "$PROV_IMPORTS" ]; then
 fi
 ok "provider imports no wbc_*/sodium_* (so it will load)"
 
-# Did O-MVLL actually run on OUR code? A .so records no obfuscation state, so this was
-# previously answered by a shell variable - and that variable said "omvll" for a year while
-# --omvll reached only WBC's sub-build and sopack's own sopk_wb.c shipped as plain -O2 output.
-# Measure the artifact. Exit 2 means "could not tell", which is NOT a pass and NOT a failure.
+# Obfuscation gate for the THIN HELPER. Unlike the provider this works on the stripped
+# artifact: the helper links no white-box at all, so its .text is 100% sopack's own code and
+# whole-.text instruction count is a direct measurement rather than a proxy.
+# rc captured explicitly - `$?` read inside an elif is one refactor away from reporting the
+# status of the test before it, and the difference here is "unobfuscated" vs "cannot tell".
 if [ "$OMVLL" -eq 1 ]; then
-    # rc captured explicitly: `$?` read inside an elif is one refactor away from reporting the
-    # status of the test before it, and the difference here is "unobfuscated" vs "cannot tell".
     OBF_RC=0
-    OBF_OUT="$(NDK="$NDK" "$SOPACK/scripts/check_obfuscated.sh" "$PROV" 2>&1)" || OBF_RC=$?
+    OBF_OUT="$(NDK="$NDK" "$SOPACK/scripts/check_obfuscated.sh" --mode text "$SKEL" 2>&1)" \
+        || OBF_RC=$?
     case "$OBF_RC" in
-        0) ok "O-MVLL demonstrably ran on sopack's own code ($OBF_OUT)" ;;
-        2) warn "could not verify mechanically whether O-MVLL ran on sopack's own code:
+        0) ok "thin helper: O-MVLL demonstrably ran ($OBF_OUT)" ;;
+        2) warn "thin helper: could not verify whether O-MVLL ran:
       $OBF_OUT" ;;
         *) die "$OBF_OUT" ;;
     esac

@@ -104,10 +104,26 @@ case "$(uname -s)" in
        Build with cipher chacha20, or with --no-omvll / --allow-unobfuscated-provider." ;;
 esac
 
+# What matters is not `uname -m` but whether an x86_64 binary can EXECUTE here: the plugin is
+# dlopen'd into the NDK's clang, and Google ships only a linux-x86_64 NDK, so on Linux the
+# relevant architecture is always x86_64. An aarch64 host with transparent emulation (Docker
+# Desktop on Apple Silicon, qemu-binfmt) runs that toolchain fine - a `uname -m` gate would
+# refuse a host that demonstrably works, which is why this probes instead of assuming.
 if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" != "x86_64" ]; then
-    die "the O-MVLL Linux plugin is x86_64-only and this host is $(uname -m).
-       Google also publishes no linux-aarch64 NDK, so this host cannot cross-build the
-       skeletons at all. Use docker/ (linux/amd64), or an x86_64 host."
+    NDK_CLANG=""
+    for n in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" "${NDK:-}"; do
+        [ -n "$n" ] && [ -x "$n/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ] \
+            && { NDK_CLANG="$n/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"; break; }
+    done
+    if [ -n "$NDK_CLANG" ] && "$NDK_CLANG" --version >/dev/null 2>&1; then
+        warn "host is $(uname -m) but the linux-x86_64 NDK toolchain executes here, so this host
+      has x86_64 emulation. Fetching the x86_64 plugin to match the clang it loads into.
+      Emulated O-MVLL runs are SLOW; generate release bundles on a native x86_64 host."
+    else
+        die "the O-MVLL Linux plugin is x86_64-only and this host is $(uname -m), with no
+       working x86_64 toolchain to load it into. Google publishes no linux-aarch64 NDK either.
+       Use docker/ (linux/amd64), or an x86_64 host."
+    fi
 fi
 
 if [ "$FORCE" -eq 0 ] && [ -f "$STAMP" ] && [ -f "$PLUGIN" ] && [ -f "$PYLIB/abc.py" ]; then

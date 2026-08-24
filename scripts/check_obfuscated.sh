@@ -2,36 +2,52 @@
 #
 # check_obfuscated.sh - decide, FROM THE ARTIFACT, whether O-MVLL ran on sopack's own code.
 #
-#   ./scripts/check_obfuscated.sh <libsopk_wb.so | sopk_rt_*.so> [--symbol NAME] [--min N]
+#   ./scripts/check_obfuscated.sh --mode text   [--min N] <sopk_rt_*.so>
+#   ./scripts/check_obfuscated.sh --mode symbol [--min N] [--symbol S] <libsopk_wb.so>
 #
-# Exit 0 and print a one-line summary if obfuscated; exit 1 with a diagnosis if not; exit 2 if
-# the question cannot be answered on this host (no llvm-objdump).
+# Exit 0 = obfuscated (prints the measurement), 1 = demonstrably NOT, 2 = cannot tell.
+# EXIT 2 IS NEVER A PASS. A caller that records "obfuscated" on a 2 is lying with extra steps.
 #
 # WHY THIS EXISTS
-#   A shared object carries no record of whether an obfuscator ran, so every caller answered
-#   "is this obfuscated?" from a shell variable. That variable read `provider-obfuscation: omvll`
-#   in shipped bundles whose provider was plain -O2 clang output, because --omvll only ever
-#   reached the WBC sub-build. A claim that cannot be checked is a claim that eventually lies.
+#   A shared object records no obfuscation state, so every caller used to answer "is this
+#   obfuscated?" from a shell variable. That variable read `provider-obfuscation: omvll` in
+#   shipped bundles whose provider was plain -O2 output, because --omvll only ever reached the
+#   WBC sub-build. HARDENING.md Method 5 recorded the same lesson after the unstripped-helper
+#   incident: "The build flag alone was not enough - a correct --release path already existed
+#   when the unstripped helper shipped. Nothing refused one." So: refuse one.
 #
-#   HARDENING.md Method 5 recorded the same lesson after the unstripped-helper incident: "The
-#   build flag alone was not enough - a correct --release path already existed when the
-#   unstripped helper shipped. Nothing refused one."
+# HOW THE SIGNAL WAS CHOSEN (all measured on this repo's toolchain, not assumed)
+#   Control-flow flattening + break_control_flow + MBA on one function:
+#       plain        32 instructions,  4 conditional branches
+#       obfuscated  441 instructions, 11 conditional branches
+#   Instructions grew 13.8x; conditional branches only 2.75x, and branch DENSITY actually fell
+#   (12.5% -> 2.5%) because flattening dispatches through computed branches. An earlier version
+#   of this script thresholded on branch count; it would have been close to useless. Code growth
+#   is the signal.
 #
-# THE SIGNAL
-#   Branch density inside sopack's own entry point. Control-flow flattening rewrites a
-#   straight-line function into a dispatch loop, multiplying conditional branches several times
-#   over; control-flow-breaking and MBA add more. Measured on the shipped UNOBFUSCATED provider,
-#   sopk_wb_k has 8 conditional branches in 544 bytes. The default floor of 40 sits far above
-#   that and far below a flattened build, so it separates the two without asserting which exact
-#   passes ran - deliberately, since the pass set is a config detail that may change.
+#   Two further findings shape the two modes:
+#
+#   1. A symbol's st_size is NOT a reliable measure. O-MVLL outlines the body into a sibling
+#      (`sopk_wb_k` 128 -> 56 bytes, plus a new `sopk_wb_k.1` of 1708). Measured naively, an
+#      obfuscated function looks SMALLER than a plain one. Mode `symbol` therefore sums the
+#      whole family: SYMBOL plus SYMBOL.* .
+#   2. Those outlined siblings are LOCAL symbols, so `llvm-strip --strip-all` deletes them.
+#      Mode `symbol` only works BEFORE the strip. Call it there.
+#
+# WHICH MODE FOR WHICH ARTIFACT
+#   thin helper  sopk_rt_<abi>.so  -> --mode text. Its .text is 100% sopack's code (it links no
+#                                    white-box at all), so whole-.text instruction count is a
+#                                    clean proxy AND survives stripping. Measured unobfuscated:
+#                                    613 instructions / 2452 bytes.
+#   provider     libsopk_wb.so     -> --mode symbol, BEFORE stripping. Its .text is 75,602
+#                                    instructions, almost all vendored libwbcrypto, so whole-
+#                                    .text would drown sopk_wb_k's 136 entirely.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOPACK="$(cd "$HERE/.." && pwd)"
-
-TARGET=""; SYMBOL="sopk_wb_k"; MIN=40
+MODE=""; TARGET=""; SYMBOL="sopk_wb_k"; MIN=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --mode)   MODE="$2"; shift 2 ;;
         --symbol) SYMBOL="$2"; shift 2 ;;
         --min)    MIN="$2"; shift 2 ;;
         -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0 ;;
@@ -39,63 +55,66 @@ while [ "$#" -gt 0 ]; do
         *)  TARGET="$1"; shift ;;
     esac
 done
-[ -n "$TARGET" ] || { echo "usage: $0 <artifact.so> [--symbol NAME] [--min N]" >&2; exit 2; }
+[ -n "$TARGET" ] || { echo "usage: $0 --mode text|symbol <artifact.so>" >&2; exit 2; }
 [ -f "$TARGET" ] || { echo "no such file: $TARGET" >&2; exit 2; }
+case "$MODE" in
+    text|symbol) ;;
+    *) echo "--mode must be 'text' (thin helper) or 'symbol' (provider, pre-strip)" >&2; exit 2 ;;
+esac
 
-# llvm-objdump from the NDK if we can find it, else anything on PATH.
-OBJDUMP=""
-if [ -n "${NDK:-}" ]; then
-    case "$(uname -s)" in
-        Darwin) HOSTTAG="darwin-x86_64" ;;
-        *)      HOSTTAG="linux-x86_64" ;;
-    esac
-    [ -x "$NDK/toolchains/llvm/prebuilt/$HOSTTAG/bin/llvm-objdump" ] \
-        && OBJDUMP="$NDK/toolchains/llvm/prebuilt/$HOSTTAG/bin/llvm-objdump"
+find_tool() {   # find_tool NAME -> path, preferring the NDK's copy
+    local n="$1" tag
+    case "$(uname -s)" in Darwin) tag="darwin-x86_64" ;; *) tag="linux-x86_64" ;; esac
+    for r in "${NDK:-}" "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}"; do
+        [ -n "$r" ] && [ -x "$r/toolchains/llvm/prebuilt/$tag/bin/$n" ] \
+            && { echo "$r/toolchains/llvm/prebuilt/$tag/bin/$n"; return 0; }
+    done
+    command -v "llvm-$n" 2>/dev/null && return 0
+    command -v "$n" 2>/dev/null && return 0
+    return 1
+}
+READELF="$(find_tool readelf || true)"
+[ -n "$READELF" ] || { echo "cannot verify obfuscation: no readelf available. That is 'unknown',
+       NOT 'obfuscated' - do not record a claim you could not check." >&2; exit 2; }
+
+if [ "$MODE" = "text" ]; then
+    : "${MIN:=1500}"   # 2.4x the measured plain 613; obfuscation grows this ~8-14x
+    OBJDUMP="$(find_tool objdump || true)"
+    [ -n "$OBJDUMP" ] || { echo "cannot verify obfuscation: no objdump available (unknown)." >&2; exit 2; }
+    INSNS="$("$OBJDUMP" -d --section=.text "$TARGET" 2>/dev/null | grep -cE '^[[:space:]]*[0-9a-f]+:' || true)"
+    : "${INSNS:=0}"
+    [ "$INSNS" -gt 0 ] || { echo "no .text instructions found in $(basename "$TARGET") (unknown)." >&2; exit 2; }
+    if [ "$INSNS" -lt "$MIN" ]; then
+        echo "$(basename "$TARGET") has $INSNS .text instructions (floor $MIN) - UNOBFUSCATED.
+       Its .text is entirely sopack's own code, so this is a direct measurement, not a proxy.
+       An unobfuscated thin helper measures 613; obfuscation grows it several times over.
+       Check that scripts/fetch_omvll.sh vendored a plugin, that stub/omvll_config_wb.py
+       exists, and that the plugin actually LOADED - clang reports an unloadable pass-plugin
+       once per translation unit, so the real error hides in the wall of output." >&2
+        exit 1
+    fi
+    echo "$(basename "$TARGET"): $INSNS .text instructions (floor $MIN)"
+    exit 0
 fi
-[ -n "$OBJDUMP" ] || OBJDUMP="$(command -v llvm-objdump || true)"
-[ -n "$OBJDUMP" ] || OBJDUMP="$(command -v objdump || true)"
-[ -n "$OBJDUMP" ] || {
-    echo "cannot verify obfuscation: no llvm-objdump/objdump on PATH and \$NDK has none.
-       This is 'unknown', NOT 'obfuscated' - do not record a claim you could not check." >&2
-    exit 2; }
 
-# Resolve the symbol from .dynsym, then disassemble an ADDRESS RANGE - do not ask objdump to
-# find the symbol by name. The artifact we are checking is always llvm-strip --strip-all'ed
-# (HARDENING.md Method 5), so it has no .symtab, and llvm-objdump's --disassemble-symbols only
-# consults .symtab: it silently prints an empty disassembly rather than erroring. GNU objdump
-# happens to fall back to .dynsym, so the check would pass or fail depending on which objdump
-# was first on PATH. --start-address/--stop-address behave identically in both.
-READELF="$(command -v llvm-readelf || command -v readelf || true)"
-[ -n "$READELF" ] || { echo "cannot verify obfuscation: no readelf on PATH." >&2; exit 2; }
-
-read -r SYM_ADDR SYM_SIZE <<<"$("$READELF" --dyn-syms -W "$TARGET" 2>/dev/null \
-    | awk -v s="$SYMBOL" '$8 == s && $4 == "FUNC" { print $2, $3; exit }')"
-if [ -z "${SYM_ADDR:-}" ] || [ -z "${SYM_SIZE:-}" ] || [ "$SYM_SIZE" -eq 0 ] 2>/dev/null; then
-    echo "cannot find exported FUNC '$SYMBOL' in $(basename "$TARGET")'s .dynsym.
-       Expected an exported entry point to measure. Wrong artifact, or the symbol was renamed." >&2
+# --- mode symbol: sum SYMBOL and its O-MVLL outlined siblings, from .symtab, PRE-STRIP -------
+: "${MIN:=600}"   # plain sopk_wb_k is 544 bytes; obfuscation took a 128-byte function to 1764
+if [ "$("$READELF" -SW "$TARGET" 2>/dev/null | grep -c '\.symtab')" -eq 0 ]; then
+    echo "$(basename "$TARGET") has no .symtab - it is already stripped, and O-MVLL's outlined
+       siblings ($SYMBOL.1, ...) are LOCAL symbols that the strip removed. This check must run
+       BEFORE llvm-strip. Cannot tell from this artifact." >&2
     exit 2
 fi
-START=$((16#$SYM_ADDR))
-STOP=$((START + SYM_SIZE))
-
-DIS="$("$OBJDUMP" -d --start-address="$START" --stop-address="$STOP" "$TARGET" 2>/dev/null || true)"
-if ! printf '%s' "$DIS" | grep -qE '^\s*[0-9a-f]+:'; then
-    echo "disassembly of $SYMBOL (0x$SYM_ADDR +$SYM_SIZE) in $(basename "$TARGET") produced nothing.
-       objdump=$OBJDUMP - is it built for this architecture?" >&2
+TOTAL="$("$READELF" -sW "$TARGET" 2>/dev/null \
+    | awk -v s="$SYMBOL" '$4=="FUNC" && ($8==s || index($8, s ".")==1) { n+=$3 } END{print n+0}')"
+if [ "$TOTAL" -eq 0 ]; then
+    echo "no FUNC symbol '$SYMBOL' (or '$SYMBOL.*') in $(basename "$TARGET") (unknown)." >&2
     exit 2
 fi
-
-BR="$(printf '%s\n' "$DIS" | grep -cE '\b(b\.[a-z]+|cbz|cbnz|tbz|tbnz|jn?[a-z]{1,2})\b' || true)"
-: "${BR:=0}"
-INSNS="$(printf '%s\n' "$DIS" | grep -cE '^\s*[0-9a-f]+:' || true)"
-: "${INSNS:=0}"
-
-if [ "$BR" -lt "$MIN" ]; then
-    echo "$SYMBOL in $(basename "$TARGET") has only $BR conditional branches in $INSNS instructions
-       (floor is $MIN) - this is an UNOBFUSCATED build. O-MVLL did not run on sopack's own code.
-       Check that scripts/fetch_omvll.sh vendored a plugin, that stub/omvll_config_wb.py exists,
-       and that the plugin actually loaded - clang reports an unloadable pass-plugin once per
-       translation unit, so the real error is easy to miss in the wall of output." >&2
+if [ "$TOTAL" -lt "$MIN" ]; then
+    echo "$SYMBOL family in $(basename "$TARGET") totals $TOTAL bytes (floor $MIN) - UNOBFUSCATED.
+       O-MVLL did not run on sopack's own code. A plain sopk_wb_k is 544 bytes and obfuscation
+       both grows it and splits it into $SYMBOL.1 etc; neither happened here." >&2
     exit 1
 fi
-echo "$SYMBOL: $BR conditional branches in $INSNS instructions (floor $MIN)"
+echo "$SYMBOL family in $(basename "$TARGET"): $TOTAL bytes across $("$READELF" -sW "$TARGET" 2>/dev/null | awk -v s="$SYMBOL" '$4=="FUNC" && ($8==s || index($8, s ".")==1)' | wc -l | tr -d ' ') symbol(s) (floor $MIN)"
