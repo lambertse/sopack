@@ -605,6 +605,23 @@ TRACE_FLAGS=""
 # The config is sopack's own (stub/omvll_config_wb.py) and is passed PER-INVOCATION via env,
 # never exported: WBC only defaults OMVLL_CONFIG when empty, so an exported value would leak
 # into the sub-build and silently unobfuscate libwbcrypto.a.
+# Version scripts pin the export sets, and they are REQUIRED whenever O-MVLL runs.
+#
+# -fvisibility=hidden is not sufficient: O-MVLL promotes the linkage of the functions it
+# transforms, so an obfuscated thin helper - which must export NOTHING - came out exporting
+# sopk_rt_ctor, self_cb, tgt_cb and sopk_wipe. That is a hardening regression in the exact shape
+# this work is about: four internal function names, naming the protocol, added to .dynsym by the
+# thing meant to hide them. Phase 4's own PASS gate caught it, which is the gate working.
+#
+# The provider needs the same treatment for the same reason; WBAES.md already documents this
+# version script as its fallback. Written unconditionally so an unobfuscated build has the same
+# export set as an obfuscated one - two link lines that differ only under a flag is how the two
+# drift apart.
+HIDE_ALL_MAP="$TMP/hide-all.map"
+PROV_MAP="$TMP/provider.map"
+printf '{ local: *; };\n' > "$HIDE_ALL_MAP"
+printf '{ global: sopk_wb_k; local: *; };\n' > "$PROV_MAP"
+
 SOPK_OMVLL_CFLAGS=()
 SOPK_OMVLL_ENV=()
 if [ "$OMVLL" -eq 1 ]; then
@@ -635,6 +652,7 @@ link_provider() {   # link_provider <extra flags…>
         -ffile-prefix-map="$WBC=." -ffile-prefix-map="$SOPACK=." \
         -fvisibility=hidden -Wl,--exclude-libs,ALL -Wl,--no-undefined \
         -Wl,-soname,"$PROV_SONAME" \
+        -Wl,--version-script="$PROV_MAP" \
         "$@" \
         -I"$WBC/include" -I"$SOPACK/stub" \
         -x c "$SOPACK/stub/sopk_wb.c" -x none \
@@ -691,6 +709,7 @@ link_skeleton() {   # link_skeleton <extra flags…>
         "${SOPK_OMVLL_CFLAGS[@]}" \
         -ffile-prefix-map="$SOPACK=." \
         -fvisibility=hidden -Wl,--no-undefined \
+        -Wl,--version-script="$HIDE_ALL_MAP" \
         "$@" \
         -I"$SOPACK/stub" \
         "$SOPACK/stub/sopk_rt.c" \

@@ -212,3 +212,33 @@ def _recover_whitening_key(packed: bytes):
             except Exception:
                 continue
     return None
+
+
+# ---- export hygiene under O-MVLL ---------------------------------------------------------
+
+def test_link_lines_carry_version_scripts():
+    """-fvisibility=hidden is NOT sufficient once O-MVLL runs.
+
+    O-MVLL promotes the linkage of the functions it transforms, so the obfuscated thin helper -
+    which must export nothing at all - came out exporting sopk_rt_ctor, self_cb, tgt_cb and
+    sopk_wipe. Four internal names describing the protocol, added to .dynsym by the pass that
+    was supposed to be hiding them. Phase 4's PASS gate caught it on a real build; this is the
+    cheap guard that the fix does not get dropped from the link lines.
+    """
+    build = (REPO / "scripts" / "build_wbaes.sh").read_text()
+    assert 'printf \'{ local: *; };\\n\' > "$HIDE_ALL_MAP"' in build
+    assert 'printf \'{ global: sopk_wb_k; local: *; };\\n\' > "$PROV_MAP"' in build
+    # Both link functions must actually use them.
+    prov = build[build.index("link_provider()"):build.index("link_skeleton()")]
+    skel = build[build.index("link_skeleton()"):]
+    assert "--version-script=\"$PROV_MAP\"" in prov, "provider link lost its version script"
+    assert "--version-script=\"$HIDE_ALL_MAP\"" in skel, "helper link lost its version script"
+
+
+def test_check_obfuscated_prefers_the_ndk_llvm_objdump():
+    """The NDK ships llvm-objdump and never a plain `objdump`. Searching only for the plain
+    name fell through to whatever was on PATH - in the builder container an x86_64-only
+    binutils, which reads an aarch64 .so as having no instructions, so the gate silently went
+    to 'cannot tell' on the one host that matters."""
+    src = (REPO / "scripts" / "check_obfuscated.sh").read_text()
+    assert 'for cand in "llvm-$n" "$n"; do' in src

@@ -77,9 +77,18 @@ esac
 find_tool() {   # find_tool NAME -> path, preferring the NDK's copy
     local n="$1" tag
     case "$(uname -s)" in Darwin) tag="darwin-x86_64" ;; *) tag="linux-x86_64" ;; esac
+    # llvm-$n FIRST inside the NDK: it ships llvm-objdump and llvm-readelf, never a plain
+    # `objdump`. Looking for the plain name only meant falling through to whatever was on PATH -
+    # and in the builder container that is an x86_64-only binutils objdump, which disassembles
+    # an aarch64 .so to nothing. The check then reported "no .text instructions" (correctly exit
+    # 2, "cannot tell") instead of measuring, so the gate went blind on the one host that
+    # matters. Prefer the cross-capable tool that is guaranteed to be present.
     for r in "${NDK:-}" "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}"; do
-        [ -n "$r" ] && [ -x "$r/toolchains/llvm/prebuilt/$tag/bin/$n" ] \
-            && { echo "$r/toolchains/llvm/prebuilt/$tag/bin/$n"; return 0; }
+        [ -n "$r" ] || continue
+        for cand in "llvm-$n" "$n"; do
+            [ -x "$r/toolchains/llvm/prebuilt/$tag/bin/$cand" ] \
+                && { echo "$r/toolchains/llvm/prebuilt/$tag/bin/$cand"; return 0; }
+        done
     done
     command -v "llvm-$n" 2>/dev/null && return 0
     command -v "$n" 2>/dev/null && return 0
@@ -95,7 +104,13 @@ if [ "$MODE" = "text" ]; then
     [ -n "$OBJDUMP" ] || { echo "cannot verify obfuscation: no objdump available (unknown)." >&2; exit 2; }
     INSNS="$("$OBJDUMP" -d --section=.text "$TARGET" 2>/dev/null | grep -cE '^[[:space:]]*[0-9a-f]+:' || true)"
     : "${INSNS:=0}"
-    [ "$INSNS" -gt 0 ] || { echo "no .text instructions found in $(basename "$TARGET") (unknown)." >&2; exit 2; }
+    if [ "$INSNS" -eq 0 ]; then
+        echo "no .text instructions found in $(basename "$TARGET") using $OBJDUMP - it most
+       likely cannot disassemble this architecture (a non-multiarch binutils objdump reads an
+       aarch64 .so as empty). Set \$NDK so the bundled llvm-objdump is used. Reporting
+       'cannot tell' rather than a pass." >&2
+        exit 2
+    fi
     if [ "$INSNS" -lt "$MIN" ]; then
         echo "$(basename "$TARGET") has $INSNS .text instructions (floor $MIN) - UNOBFUSCATED.
        Its .text is entirely sopack's own code, so this is a direct measurement, not a proxy.

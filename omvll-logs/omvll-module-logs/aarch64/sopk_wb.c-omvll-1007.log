@@ -1,0 +1,31 @@
+[omvll::AntiHook] Executing on module /workspace/stub/sopk_wb.c
+[omvll::AntiHook] Changes not applied on module /workspace/stub/sopk_wb.c
+[omvll::FunctionOutline] Executing on module /workspace/stub/sopk_wb.c
+[omvll::StringEncoding] Executing on module /workspace/stub/sopk_wb.c
+[omvll::StringEncoding] Changes not applied on module /workspace/stub/sopk_wb.c
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_wb.c over structure struct.wb_self_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_wb.c over structure struct.sopk_wb_region
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_wb.c over structure struct.sopk_wb_region
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_wb.c over structure struct.wb_self_scan
+[omvll::OpaqueFieldAccess] Changes  applied on module /workspace/stub/sopk_wb.c
+[omvll::BasicBlockDuplicate] Executing on module /workspace/stub/sopk_wb.c
+[omvll::BasicBlockDuplicate] Changes not applied on module /workspace/stub/sopk_wb.c
+[omvll::ControlFlowFlattening] Executing on module /workspace/stub/sopk_wb.c
+[omvll::ControlFlowFlattening] Changes not applied on module /workspace/stub/sopk_wb.c
+[omvll::BreakControlFlow] Executing on module /workspace/stub/sopk_wb.c
+[omvll::BreakControlFlow] Visiting function sopk_wb_k
+[omvll::BreakControlFlow] Total of 1 functions were modified on module /workspace/stub/sopk_wb.c
+[omvll::BreakControlFlow] Changes  applied on module /workspace/stub/sopk_wb.c
+[omvll::OpaqueConstants] Executing on module /workspace/stub/sopk_wb.c
+[omvll::OpaqueConstants] Changes  applied on module /workspace/stub/sopk_wb.c
+[omvll::Arithmetic] Executing on module /workspace/stub/sopk_wb.c
+[omvll::Arithmetic] Visiting function sopk_wb_k
+[omvll::Arithmetic][sopk_wb_k] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic][sopk_wb_k] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic] Changes not applied on module /workspace/stub/sopk_wb.c
+[omvll::IndirectCall] Executing on module /workspace/stub/sopk_wb.c
+[omvll::IndirectCall] Changes not applied on module /workspace/stub/sopk_wb.c
+[omvll::IndirectBranch] Executing on module /workspace/stub/sopk_wb.c
+[omvll::IndirectBranch] Changes not applied on module /workspace/stub/sopk_wb.c
+[omvll::Cleaning] Executing on module /workspace/stub/sopk_wb.c
+[omvll::Cleaning] Changes  applied on module /workspace/stub/sopk_wb.c
