@@ -17,6 +17,20 @@
 #          sopack warns on every pack in this mode.
 cipher: wbaes
 
+# Recompile a freshly-seeded, O-MVLL-obfuscated stub for every pack, so no two
+# apps ship the same one. Stub ciphers only (wbaes injects no stub, and the
+# combination is an error rather than a no-op).
+#
+# This is what makes chacha20 defensible: the prebuilt stub is byte-identical in
+# every app, so its whitening key is a precomputable constant and a universal
+# unpacker needs no reverse engineering. Seeded, two packs of the same library
+# differ in ~89% of stub bytes and each app has its own key.
+#
+# Off by default because it needs the NDK and the O-MVLL plugin AT PACK TIME
+# (./scripts/fetch_omvll.sh), which breaks the prebuilt-blob model and slows
+# packs. The seed used is recorded in report.json.
+obfuscate: false
+
 # A list, or the string "all" for every supported ABI
 # (arm64-v8a, armeabi-v7a, x86_64). arm64-v8a is the only ABI protected in
 # practice; the others ship their .text in cleartext.

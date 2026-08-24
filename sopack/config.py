@@ -81,6 +81,20 @@ SAMPLE_YAML = """\
 #          sopack warns on every pack in this mode.
 cipher: wbaes
 
+# Recompile a freshly-seeded, O-MVLL-obfuscated stub for every pack, so no two
+# apps ship the same one. Stub ciphers only (wbaes injects no stub, and the
+# combination is an error rather than a no-op).
+#
+# This is what makes chacha20 defensible: the prebuilt stub is byte-identical in
+# every app, so its whitening key is a precomputable constant and a universal
+# unpacker needs no reverse engineering. Seeded, two packs of the same library
+# differ in ~89% of stub bytes and each app has its own key.
+#
+# Off by default because it needs the NDK and the O-MVLL plugin AT PACK TIME
+# (./scripts/fetch_omvll.sh), which breaks the prebuilt-blob model and slows
+# packs. The seed used is recorded in report.json.
+obfuscate: false
+
 # A list, or the string "all" for every supported ABI
 # (arm64-v8a, armeabi-v7a, x86_64). arm64-v8a is the only ABI protected in
 # practice; the others ship their .text in cleartext.
@@ -245,6 +259,10 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class Config:
     cipher: str = "wbaes"
+    # Recompile a freshly-seeded, O-MVLL-obfuscated stub for every pack, so no two apps ship
+    # the same stub. Stub ciphers only. Off by default because it needs the NDK + the O-MVLL
+    # plugin AT PACK TIME, which breaks the prebuilt-blob model and slows packs.
+    obfuscate: bool = False
     abis: tuple[str, ...] = DEFAULT_ABIS
     libraries: LibraryConfig = field(default_factory=LibraryConfig)
     signing: SigningConfig = field(default_factory=SigningConfig)
@@ -256,7 +274,7 @@ class Config:
 
 
 # ---- validation helpers ------------------------------------------------------------
-_TOP_KEYS = frozenset({"cipher", "abis", "libraries", "signing", "logging"})
+_TOP_KEYS = frozenset({"cipher", "obfuscate", "abis", "libraries", "signing", "logging"})
 _LIB_KEYS = frozenset({"include", "exclude"})
 _SIGN_KEYS = frozenset({"sign", "verify", "min-sdk", "keystore"})
 _KS_KEYS = frozenset({"path", "alias", "store-pass", "key-pass"})
@@ -557,8 +575,19 @@ def _build(data: dict) -> Config:
     elif cipher not in CIPHERS:
         raise ConfigError(f"cipher: expected one of {', '.join(CIPHERS)}; got {cipher!r}")
 
+    obfuscate = _as_bool(data.get("obfuscate"), "obfuscate", d.obfuscate)
+    # Rejected rather than ignored. wbaes never injects the stub, so `obfuscate: true` there
+    # would do nothing at all - and a user who believes they turned protection on and did not
+    # is worse off than one who got an error. Same rule as every other key in this file.
+    if obfuscate and cipher == "wbaes":
+        raise ConfigError(
+            "obfuscate: true is not compatible with cipher: wbaes. Per-pack stub polymorphism "
+            "only applies to the stub ciphers (chacha20/xor); wbaes injects no stub and already "
+            "seals a fresh key per pack. Either drop `obfuscate` or set `cipher: chacha20`.")
+
     return Config(
         cipher=cipher,
+        obfuscate=obfuscate,
         abis=_build_abis(data.get("abis"), d.abis),
         libraries=_build_libraries(data.get("libraries")),
         signing=_build_signing(data.get("signing")),

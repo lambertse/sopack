@@ -20,7 +20,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="$HERE/../sopack/stubs"
+# Output dir: default ships into the package; SOPK_STUB_OUT lets the per-pack polymorphic path
+# build a fresh, seeded, obfuscated stub set into a temp dir without touching the shipped one.
+OUT="${SOPK_STUB_OUT:-$HERE/../sopack/stubs}"
 
 # API level is positional (historically `build_stubs.sh 24`), and --with-log is a flag, so the
 # flag has to be filtered out before ${1} is read as the API - otherwise `build_stubs.sh
@@ -85,6 +87,27 @@ LDFLAGS=(
     -Wl,-T,"$HERE/stub.ld"
 )
 
+# ---- optional O-MVLL obfuscation (opt-in, per-pack polymorphism) --------------------------
+# Set OMVLL_PLUGIN to compile the stub through the O-MVLL pass-plugin. Only the guard-safe pass
+# set is enabled by stub/omvll_config.py; the no-reloc / no-undef / no-adrp guards below still
+# gate every build, and they are what makes this safe to enable at all.
+#
+# SOPK_SEED makes the obfuscation shape per-build. That is the point: without it the stub is
+# byte-identical in every packed app, so its whitening key is a precomputable constant and an
+# analyst needs no reverse engineering at all to write a universal unpacker
+# (docs/technical/STATIC-ANALYSIS-REVIEW.md S2). With it, two packs of the same library differ
+# in most of their stub bytes and there is no cross-app shortcut.
+OMVLL_FLAGS=()
+if [[ -n "${OMVLL_PLUGIN:-}" ]]; then
+    [[ -f "$OMVLL_PLUGIN" ]] || { echo "ERROR: OMVLL_PLUGIN=$OMVLL_PLUGIN not found" >&2; exit 1; }
+    export OMVLL_CONFIG="${OMVLL_CONFIG:-$HERE/omvll_config.py}"
+    [[ -f "$OMVLL_CONFIG" ]] || { echo "ERROR: OMVLL_CONFIG=$OMVLL_CONFIG not found - without a
+       config the plugin loads but applies NO passes, i.e. an unobfuscated build that looks
+       obfuscated." >&2; exit 1; }
+    OMVLL_FLAGS=(-fpass-plugin="$OMVLL_PLUGIN")
+    echo "obfuscation: O-MVLL ($OMVLL_PLUGIN)  config=$OMVLL_CONFIG  seed=${SOPK_SEED:-<none>}"
+fi
+
 sym_off() {  # sym_off <elf> <name> -> hex offset (== vaddr, image based at 0)
     "$READELF" -sW "$1" | awk -v n="$2" '$8==n {print "0x"$2; exit}'
 }
@@ -105,7 +128,16 @@ for PAIR in $TARGETS; do
     EXTRA=""
     if [ "$ABI" = "arm64-v8a" ]; then EXTRA="-mcmodel=tiny"; fi
 
-    "$CLANG" --target="$TRIPLE" $EXTRA "${CFLAGS[@]}" "${LDFLAGS[@]}" \
+    # O-MVLL is applied to arm64-v8a ONLY. It supports AArch64/AArch32 but not x86_64, and the
+    # full pass set exhausts AArch32's smaller register file in the freestanding stub ("ran out
+    # of registers"); armv7 would need a lighter, 32-bit-specific set. arm64 is also the only
+    # ABI protected in practice, so this is where it matters.
+    THIS_OMVLL=()
+    if [[ ${#OMVLL_FLAGS[@]} -gt 0 && "$ABI" == "arm64-v8a" ]]; then
+        THIS_OMVLL=("${OMVLL_FLAGS[@]}")
+    fi
+
+    "$CLANG" --target="$TRIPLE" $EXTRA "${THIS_OMVLL[@]}" "${CFLAGS[@]}" "${LDFLAGS[@]}" \
         -I"$HERE" "$HERE/stub.c" -o "$ELF"
 
     # Hard requirement: no dynamic relocations and no undefined symbols, or the blob

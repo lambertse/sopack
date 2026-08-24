@@ -216,6 +216,11 @@ class RepackResult:
     # Which container this was, as container.Container.kind ("apk" | "aab"). Recorded so the run
     # report and the CLI's closing advice can differ without re-detecting the format.
     container: str = APK_CONTAINER.kind
+    # The O-MVLL seed this pack's stub was built with, when `obfuscate: true`. It is the only
+    # handle that makes a given pack's stub reproducible afterwards, so it belongs in the run
+    # record - not because it is secret (it is not; the stub ships) but because "which shape
+    # did THIS app get?" is otherwise unanswerable.
+    obf_seed: int | None = None
     # Protected libraries that ALSO ship, unencrypted, under an ABI this pack did not cover -
     # in the SAME container. Each entry is (protected_entry, [cleartext_entry, ...]).
     #
@@ -338,6 +343,11 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
               wb_keygen: str | None = None,
               allow_helper_log: bool = False,
               exclude_libs: list[str] | None = None,
+              # Recompile a freshly-seeded, O-MVLL-obfuscated stub for THIS pack, instead of
+              # injecting the prebuilt one. See sopack/obfuscate.py: the prebuilt stub is
+              # byte-identical in every app, which makes its whitening key a public constant.
+              # Stub ciphers only - wbaes does not use the stub at all.
+              obfuscate: bool = False,
               no_sign: bool = False,
               logger=print,
               # None means "look at the file". Detection is by content, so a library caller
@@ -345,6 +355,13 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
               # format in order to print it, does not have to re-read the central directory of a
               # 150 MB bundle. Additive, so every existing caller keeps working.
               container: Container | None = None) -> RepackResult:
+    # Checked FIRST, before any file is opened: an argument contradiction should be reported as
+    # such, not as whatever I/O error happens to come first. config.py rejects this combination
+    # too, but repackage() is library API and can be called directly.
+    if obfuscate and cipher == "wbaes":
+        raise ValueError(
+            "obfuscate is only meaningful for the stub ciphers; `cipher: wbaes` does not "
+            "inject a stub at all, and already has per-pack key diversity.")
     # `None` means auto-select every native library; an empty list is NOT the same thing
     # (config.py rejects `libraries.include: []` rather than silently widening the scope).
     auto = wanted_libs is None
@@ -381,6 +398,18 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
         # copy wins has to unwrap every module's thin helpers. Sealing per (module, abi) would put
         # two different KEKs behind one soname and a helper from module A would unwrap against
         # module B's blob -> sopk_fail -> abort(), on essentially every launch.
+        # ONE polymorphic stub set per pack, built before the entry loop and reused for every
+        # library. Per-PACK, not per-library: the point is that two APKS differ, and rebuilding
+        # per library would multiply an already slow step (a full clang+lld run through O-MVLL)
+        # by the library count for no extra protection - every library in one app is reached by
+        # the same analyst anyway.
+        stub_dir = None
+        if obfuscate:
+            from .obfuscate import build_obfuscated_stubs
+            stub_dir = os.path.join(tmp, "obfstubs")
+            os.makedirs(stub_dir, exist_ok=True)
+            result.obf_seed = build_obfuscated_stubs(stub_dir)
+
         pack_keys: dict[str, object] = {}
         # (module, abi) -> ZIP date_time to stamp that slot's provider with (see the helper note
         # below). "module" is "" for an APK, which has exactly one slot per ABI.
@@ -437,7 +466,8 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                         ir = inject_so(src, dst, abi, cipher=cipher, log=log,
                                        wb_keygen=wb_keygen, target_name=m["so"],
                                        allow_helper_log=allow_helper_log,
-                                       pack_key=pack_keys.get(abi))
+                                       pack_key=pack_keys.get(abi),
+                                       stub_dir=stub_dir)
                     except InjectError as e:
                         # An explicitly named library still aborts the pack - the user
                         # asked for THAT library and a silent downgrade to cleartext would

@@ -240,7 +240,8 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
     # and for an APK there is nothing to say - it is what this tool has always taken.
     if cont is not APK_CONTAINER:
         diag.emit("  input: Android App Bundle (detected)")
-    diag.emit(f"  cipher={cfg.cipher}  abis={','.join(cfg.abis)}")
+    diag.emit(f"  cipher={cfg.cipher}  abis={','.join(cfg.abis)}"
+              f"{'  obfuscate=on' if cfg.obfuscate else ''}")
     # The stub ciphers ship a key that is recoverable from the artifact with NO reverse
     # engineering: the whitening key is a checksum over stub bytes that are byte-identical in
     # every packed app, so it is a precomputable constant, not a per-app secret. The whitening
@@ -276,6 +277,7 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
                     log=cfg.logging.stub_log,
                     allow_helper_log=cfg.logging.allow_helper_log,
                     exclude_libs=excludes, no_sign=not cfg.signing.sign,
+                    obfuscate=cfg.obfuscate,
                     logger=diag.emit, container=cont)
     ctx["res"] = res
 

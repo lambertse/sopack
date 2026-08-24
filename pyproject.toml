@@ -30,3 +30,8 @@ packages = ["sopack"]
 
 [tool.setuptools.package-data]
 sopack = ["stubs/*.bin", "stubs/*.json"]
+
+[tool.pytest.ini_options]
+# `slow` marks the tests that shell out to clang+lld through O-MVLL. They skip themselves when
+# the toolchain is absent, so this is a label for `-m "not slow"`, not a gate.
+markers = ["slow: needs the NDK + O-MVLL toolchain and takes seconds, not milliseconds"]

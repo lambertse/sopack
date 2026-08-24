@@ -1179,11 +1179,12 @@ def inject_so(in_path: str, out_path: str, abi: str,
               wb_keygen: str | None = None,
               target_name: str | None = None,
               allow_helper_log: bool = False,
-              pack_key: "PackKey | None" = None) -> InjectResult:
+              pack_key: "PackKey | None" = None,
+              stub_dir=None) -> InjectResult:
     if CIPHER_IDS[cipher] == CIPHER_WBAES:
         return _inject_wbaes(in_path, out_path, abi, wb_keygen, target_name,
                              allow_helper_log=allow_helper_log, pack_key=pack_key)
-    stub: Stub = load_stub(abi)
+    stub: Stub = load_stub(abi, stub_dir)
     # logging.stub-log needs a stub built with -DSOPK_STUB_LOG. A default stub has the logging
     # code compiled out entirely, so honouring the flag would produce an artifact that silently
     # never logs - the same "you believe you turned something on and did not" failure the config

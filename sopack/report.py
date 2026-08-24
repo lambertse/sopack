@@ -93,6 +93,9 @@ def build(cfg, res, *, input_apk, output_apk, exit_code, error, config_source,
         "failed_count": len(failed),
         "not_selected_count": len(untouched),
         "cross_abi_cleartext_count": len(getattr(res, "cross_abi_cleartext", []) or []),
+        # The O-MVLL seed for a polymorphic pack, else null. Not a secret - the stub ships -
+        # but it is the only handle that reproduces THIS app's stub shape after the fact.
+        "obf_seed": getattr(res, "obf_seed", None),
         # None (not False) when we never got as far as signing, so a consumer can tell "left
         # unsigned" apart from "never reached that stage".
         "signed": getattr(res, "signed", None) if res is not None else None,
