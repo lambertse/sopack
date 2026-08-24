@@ -1,0 +1,36 @@
+# Build context hygiene. docker/Dockerfile's context is the REPO ROOT (it COPYs
+# scripts/fetch_omvll.sh, so it cannot be docker/ any more) - without this file the whole
+# working tree goes to the daemon, and output/ alone holds multi-hundred-MB APKs.
+#
+# Adapted from the .dockerignore on the obfuscate-polymorphic-stub branch; `assets/` is gone
+# (it was split three ways and retired), and the four generated directories that replaced it
+# are listed instead.
+.git
+.github
+
+# The four generated/large directories (see CLAUDE.md "Directory layout" and .gitignore).
+output/
+out/
+artifacts/
+test_apks/
+vendor/
+build/
+
+# ~65-95 MB of fetched plugin + CPython stdlib. The image fetches its own copy into /opt/omvll
+# using the pinned script, so shipping a host copy in the context is pure waste.
+third_party/omvll/
+
+# The submodule's own fetched trees, same reasoning.
+third_party/whitebox-cryptography/third_party/libsodium/
+third_party/whitebox-cryptography/third_party/omvll/
+third_party/whitebox-cryptography/third_party/python/
+third_party/whitebox-cryptography/build-android/
+third_party/whitebox-cryptography/build-host/
+
+**/*.apk
+**/*.aab
+**/*.so.orig
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+*.egg-info/

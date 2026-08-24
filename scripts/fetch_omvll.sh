@@ -38,7 +38,9 @@ SOPACK="$(cd "$HERE/.." && pwd)"
 # shellcheck source=scripts/_common.sh
 . "$HERE/_common.sh"
 
-DEST="$SOPACK/third_party/omvll"
+# $SOPACK_OMVLL_DIR lets a prepared environment (docker/, which bakes the plugin into an image
+# layer) point at an already-vendored copy without a bind-mount dance. --dir still wins.
+DEST="${SOPACK_OMVLL_DIR:-$SOPACK/third_party/omvll}"
 FORCE=0
 PRINT=""
 

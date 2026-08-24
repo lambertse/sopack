@@ -10,11 +10,14 @@ both wbaes skeletons are Android target ELFs that do not care what packed them.
 ## Build the image
 
 ```bash
-docker build --platform linux/amd64 -t sopack-bundler docker/
+docker build --platform linux/amd64 -f docker/Dockerfile -t sopack-bundler .
 ```
 
-The build context is `docker/`, not the repo root — the image carries no sopack source; the
-checkout arrives as a bind mount at run time.
+The build context is the **repo root** (note `-f docker/Dockerfile .`), because the image
+`COPY`s `scripts/fetch_omvll.sh` to fetch the O-MVLL plugin with sopack's own pin. It still
+carries no sopack *source* — the checkout arrives as a bind mount at run time — and
+`.dockerignore` keeps the context small (without it, `output/` alone would send hundreds of MB
+to the daemon). This used to be `docker/`, when O-MVLL was fetched by cloning the submodule.
 
 It downloads the NDK, the O-MVLL Linux plugin, libsodium and a CPython 3.10 stdlib and bakes
 them in, so container runs afterwards need no network. The NDK dominates both the download and
@@ -29,7 +32,7 @@ SHA to bake it in — a branch name resolves to whatever its tip is at build tim
 from the submodule pin:
 
 ```bash
-docker build --platform linux/amd64 --build-arg WBC_REF=<sha> -t sopack-bundler docker/
+docker build --platform linux/amd64 -f docker/Dockerfile --build-arg WBC_REF=<sha> -t sopack-bundler .
 ```
 
 ## Generate a bundle
@@ -140,13 +143,13 @@ entrypoint warns when it detects this.
 |---|---|---|
 | Base | `ubuntu:24.04` (glibc 2.39) | the O-MVLL 1.9.1 Linux plugin requires **`GLIBC_2.38`**. On `debian:bookworm` (2.36) clang refuses to load it — once per translation unit — and the build dies in Phase 4. Asserted at image build time |
 | NDK | `29.0.14206865` (`android-ndk-r29-linux.zip`) | dictated by O-MVLL: its plugin is built against r29's clang, and an LLVM pass-plugin only loads into the compiler it was built for |
-| O-MVLL | 1.9.1 Linux, SHA256 `f1f8f888…` | pinned in the whitebox-cryptography submodule's `third_party/fetch_deps.sh` |
+| O-MVLL | 1.9.1 Linux, SHA256 `f1f8f888…` | pinned in **sopack's** `scripts/fetch_omvll.sh`, and baked into `/opt/omvll` at image build. The submodule keeps its own copy of the pin purely as a standalone-dev fallback; `build_wbaes.sh` warns if the two drift |
 | Static C++ link | asserted, not assumed | `build_wbaes.sh` links `wb_keygen` with `-static -static-libstdc++ -static-libgcc` so the bundle carries no glibc floor and installs on any distro; gate 4 of the bundler refuses a dynamically linked one. The image proves the link works at build time rather than naming a `libstdc++-N-dev` package that tracks the base's default gcc |
 
 **The base image's glibc and the bundle's portability are unrelated.** The base needs to be *new*
 so O-MVLL loads; the bundle stays distro-agnostic because its only native binary is static. Do not
 "fix" a target-side glibc complaint by changing the base — check gate 4 instead.
 
-Bumping the NDK means bumping the O-MVLL pin in the submodule too, or the plugin stops loading —
+Bumping the NDK means bumping the O-MVLL pin in `scripts/fetch_omvll.sh` too, or the plugin stops loading —
 and a plugin that fails to load is the one way to get an unobfuscated provider out of a build
 that otherwise looks successful.

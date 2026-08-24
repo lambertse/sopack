@@ -119,6 +119,7 @@ RUN curl -fsSL -o /tmp/ndk.zip "https://dl.google.com/android/repository/${NDK_Z
     && unzip -q /tmp/ndk.zip -d /opt \
     && rm /tmp/ndk.zip \
     && test -d /opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin
+ENV SOPACK_OMVLL_DIR=/opt/omvll
 ENV NDK=/opt/android-ndk-r29
 ENV ANDROID_NDK_HOME=/opt/android-ndk-r29
 
@@ -141,27 +142,41 @@ ENV ANDROID_NDK_HOME=/opt/android-ndk-r29
 # Prefer passing a SHA (--build-arg WBC_REF=<sha>) matching the submodule pin once it is pushed:
 # a branch name resolves to whatever its tip is at build time, which can drift from the checkout.
 ARG WBC_REPO=https://github.com/lambertse/whitebox-cryptography
-ARG WBC_REF=feat/linux-omvll
+ARG WBC_REF=feat/omvll-as-input
 SHELL ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+
+# ---- O-MVLL: fetched DIRECTLY, because sopack owns this pin now --------------------------
+# This used to be laundered through the submodule: clone WBC, run its fetch_deps.sh, copy the
+# result back out. That was always the wrong shape - sopack downloaded the plugin and then
+# pretended WBC had. It also coupled the image to WBC's fetcher, which is now only WBC's
+# standalone fallback.
+#
+# The pin is read from the checkout's own scripts/fetch_omvll.sh rather than duplicated here:
+# a fourth copy of a SHA256 is a fourth thing to forget. COPY needs the build context to be the
+# repo root, which is what docker/README.md's build command now passes.
+COPY scripts/fetch_omvll.sh scripts/_common.sh /opt/sopack-scripts/
+RUN mkdir -p /opt/omvll \
+    && /opt/sopack-scripts/fetch_omvll.sh --dir /opt/omvll \
+    && test -f /opt/omvll/omvll_ndk_r29.so \
+    && test -f /opt/omvll/python/Lib/abc.py
+
+# ---- the remaining WBC deps (libsodium; python only as WBC's own fallback) ----------------
 RUN mkdir -p /opt/wbc-deps; \
     prewarm() { \
         git clone --quiet "$WBC_REPO" /tmp/wbc || return 1; \
         git -C /tmp/wbc checkout --quiet "$WBC_REF" || return 1; \
-        grep -q 'omvll_plugin_path' /tmp/wbc/third_party/fetch_deps.sh || return 1; \
-        ( cd /tmp/wbc && ./third_party/fetch_deps.sh all ) || return 1; \
-        cp -a /tmp/wbc/third_party/libsodium /tmp/wbc/third_party/omvll \
-              /tmp/wbc/third_party/python /opt/wbc-deps/ || return 1; \
-        test -f /opt/wbc-deps/omvll/omvll_ndk_r29.so || return 1; \
-        test -f /opt/wbc-deps/python/Lib/abc.py || return 1; \
+        ( cd /tmp/wbc && ./third_party/fetch_deps.sh libsodium ) || return 1; \
+        cp -a /tmp/wbc/third_party/libsodium /opt/wbc-deps/ || return 1; \
     }; \
     if prewarm; then \
         echo "pre-warmed the whitebox-cryptography deps from $WBC_REF"; \
     else \
         rm -rf /opt/wbc-deps; mkdir -p /opt/wbc-deps; \
-        echo "NOTE: could not pre-warm from '$WBC_REF' in $WBC_REPO - either the ref is not on"; \
-        echo "      the remote yet, or it predates Linux O-MVLL support. The image is still"; \
-        echo "      usable: the entrypoint will fetch the deps into the mounted submodule on"; \
-        echo "      the first run, which needs network once. Rebuild with --build-arg WBC_REF=<sha>"; \
+        echo "NOTE: could not pre-warm libsodium from '$WBC_REF' in $WBC_REPO - the ref is"; \
+        echo "      probably not on the remote yet. The image is still usable: O-MVLL is"; \
+        echo "      already baked in above (sopack owns that pin), and"; \
+        echo "      the entrypoint will fetch libsodium into the mounted submodule on the"; \
+        echo "      first run. Rebuild with --build-arg WBC_REF=<sha>"; \
         echo "      once the commit is pushed to bake them in."; \
     fi; \
     rm -rf /tmp/wbc

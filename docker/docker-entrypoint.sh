@@ -56,7 +56,10 @@ fi
 # overwritten. /opt/wbc-deps is empty when the image could not pre-warm (see the Dockerfile) - in
 # that case fall through to fetching, which is the same thing the pre-warm would have done.
 mkdir -p "$WBC/third_party"
-for d in libsodium omvll python; do
+# Only libsodium now. O-MVLL and its CPython stdlib are sopack's (see below) and no longer get
+# copied into the submodule at all - that copying was the old inside-out arrangement, where
+# sopack downloaded the plugin and then wrote it into WBC's tree so WBC could "find" it.
+for d in libsodium; do
     if [ ! -e "$WBC/third_party/$d" ] && [ -e "/opt/wbc-deps/$d" ]; then
         cp -a "/opt/wbc-deps/$d" "$WBC/third_party/$d"
         printf '    seeded third_party/%s from the image\n' "$d"
@@ -70,18 +73,32 @@ for a in "$@"; do
     [ "$a" = "--allow-unobfuscated-provider" ] && WANT_OMVLL=0
 done
 
-if [ "$WANT_OMVLL" -eq 1 ] && [ ! -f "$WBC/third_party/omvll/omvll_ndk_r29.so" ]; then
-    printf '    no O-MVLL Linux plugin yet - fetching (needs network, once)\n'
-    ( cd "$WBC" && ./third_party/fetch_deps.sh all ) \
-        || die "fetch_deps.sh failed. If this container has no network, pre-warm the image
-       instead (docker build --build-arg WBC_REF=<a pushed sha>), or pass
-       --allow-unobfuscated-provider to build without O-MVLL."
-    [ -f "$WBC/third_party/omvll/omvll_ndk_r29.so" ] \
-        || die "fetch_deps.sh ran but produced no omvll_ndk_r29.so. The submodule predates Linux
-       O-MVLL support - update it, or pass --allow-unobfuscated-provider."
-elif [ "$WANT_OMVLL" -eq 0 ]; then
-    printf '    --allow-unobfuscated-provider: skipping the O-MVLL plugin entirely\n'
+# libsodium is needed either way; O-MVLL only for an obfuscated build, hence the split.
+if [ ! -e "$WBC/third_party/libsodium" ]; then
+    printf '    no libsodium yet - fetching (needs network, once)\n'
     ( cd "$WBC" && ./third_party/fetch_deps.sh libsodium ) || die "fetch_deps.sh libsodium failed"
+fi
+
+# O-MVLL is sopack's now, and the image baked it at $SOPACK_OMVLL_DIR. Seed the checkout's own
+# third_party/omvll from that rather than downloading again - the bind-mounted checkout starts
+# empty there because the directory is gitignored.
+if [ "$WANT_OMVLL" -eq 1 ]; then
+    OMVLL_SRC="${SOPACK_OMVLL_DIR:-/opt/omvll}"
+    OMVLL_DST="$SOPACK/third_party/omvll"
+    if [ ! -f "$OMVLL_DST/omvll_ndk_r29.so" ]; then
+        if [ -f "$OMVLL_SRC/omvll_ndk_r29.so" ]; then
+            mkdir -p "$OMVLL_DST"
+            cp -a "$OMVLL_SRC/." "$OMVLL_DST/"
+            printf '    seeded third_party/omvll from the image (no network needed)\n'
+        else
+            printf '    no O-MVLL plugin baked in - fetching (needs network, once)\n'
+            "$SOPACK/scripts/fetch_omvll.sh" \
+                || die "scripts/fetch_omvll.sh failed. If this container has no network, rebuild
+       the image so the plugin is baked in, or pass --allow-unobfuscated-provider."
+        fi
+    fi
+else
+    printf '    --allow-unobfuscated-provider: skipping the O-MVLL plugin entirely\n'
 fi
 
 # 2. sopack itself, into a venv under /tmp rather than the system python.
