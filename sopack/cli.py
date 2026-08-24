@@ -132,6 +132,20 @@ def _print_summary(res, abis) -> None:
         diag.emit("\nSkipped (selected but could not be injected - these ship in CLEARTEXT):")
         for entry, err in res.failed:
             diag.emit(f"  {entry}: {err}")
+    if getattr(res, "cross_abi_cleartext", None):
+        n = len(res.cross_abi_cleartext)
+        # Deliberately loud, and placed before the per-library list rather than after it. A bare
+        # "Injected N libraries" reads as full coverage; this is the line that says the
+        # protection is bypassable without attacking it. See docs/technical/STATIC-ANALYSIS-REVIEW.md S1.
+        diag.warn(f"  BYPASS: {n} protected librar{'y' if n == 1 else 'ies'} also ship "
+                  f"UNENCRYPTED under another ABI in the same container:")
+        for entry, others in res.cross_abi_cleartext:
+            diag.warn(f"    {entry}")
+            for o in others:
+                diag.warn(f"      also, in cleartext: {o}")
+        diag.warn("  A static analyst reads the cleartext copy instead. Widen `abis:` to cover "
+                  "them, or ship only the ABIs you protect.")
+
     if res.untouched:
         by_reason: dict[str, list[str]] = {}
         for entry, reason in res.untouched:
@@ -227,6 +241,23 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
     if cont is not APK_CONTAINER:
         diag.emit("  input: Android App Bundle (detected)")
     diag.emit(f"  cipher={cfg.cipher}  abis={','.join(cfg.abis)}")
+    # The stub ciphers ship a key that is recoverable from the artifact with NO reverse
+    # engineering: the whitening key is a checksum over stub bytes that are byte-identical in
+    # every packed app, so it is a precomputable constant, not a per-app secret. The whitening
+    # also does not remove the signature it was meant to remove - it replaces `SOPK` with a
+    # different fixed 48-byte needle at the same offset. See
+    # docs/technical/STATIC-ANALYSIS-REVIEW.md S2.
+    #
+    # Gated on `obfuscate` too, even though that setting does not exist yet: a per-pack
+    # polymorphic stub makes the stub bytes differ per app, at which point this warning becomes
+    # false. Writing the condition now costs one clause; revising the warning later is the kind
+    # of thing that gets missed and ships wrong.
+    if cfg.cipher != "wbaes" and not getattr(cfg, "obfuscate", False):
+        diag.warn(
+            f"  cipher={cfg.cipher} is NOT the recommended mode. Its decryption key is\n"
+            f"  recoverable from the packed file with no reverse engineering at all - the stub\n"
+            f"  is byte-identical in every app, so its whitening key is a public constant.\n"
+            f"  `cipher: wbaes` (the default) seals a fresh key per pack into a white-box.")
     diag.emit(f"  libs={'ALL ' + cont.lib_shape if libs is None else ','.join(libs)}")
     diag.emit(f"  excluding: {', '.join(eff_excludes)}")
     # A warning, never an error: the container is decided by content, so a misnamed output is

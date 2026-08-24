@@ -11,8 +11,9 @@ import zipfile
 import pytest
 
 from conftest import mkapk as _mkapk
+from conftest import mkapk
 
-from sopack import apk, cli, config
+from sopack import apk, cli, config, container
 from sopack.apk import (ALWAYS_EXCLUDE_PATTERNS, _classify, _match_lib_pattern,
                         build_excludes)
 from sopack.elf_inject import InjectError, InjectResult
@@ -289,3 +290,73 @@ def test_untouched_entries_carry_a_reason(tmp_path, monkeypatch):
         "lib/arm64-v8a/libflutter.so": "excluded by 'libflutter'",
         "lib/armeabi-v7a/libapp.so": "abi not selected",
     }
+
+
+# ---- cross-ABI cleartext detection -----------------------------------------------------
+#
+# The bypass this reports is not a coverage gap: with `abis: [arm64-v8a]` (the default), a
+# library protected on arm64 commonly ships an unencrypted, source-equivalent build one
+# directory over in the SAME container. Measured on the repo's own output/vsa-encrypted.apk,
+# 20 of 21 protected libraries had such a counterpart. sopack does not close that - it reports
+# it, so the exposure is measured rather than invisible.
+
+def test_cross_abi_reports_same_basename_under_other_abi():
+    ents = ["lib/arm64-v8a/libpki.so", "lib/armeabi-v7a/libpki.so",
+            "lib/x86_64/libpki.so", "res/x.png"]
+    got = apk.find_cross_abi_cleartext(ents, ["lib/arm64-v8a/libpki.so"], container.APK)
+    assert got == [("lib/arm64-v8a/libpki.so",
+                    ["lib/armeabi-v7a/libpki.so", "lib/x86_64/libpki.so"])]
+
+
+def test_cross_abi_silent_when_the_library_is_arm64_only():
+    ents = ["lib/arm64-v8a/libonly.so", "lib/armeabi-v7a/libother.so"]
+    assert apk.find_cross_abi_cleartext(ents, ["lib/arm64-v8a/libonly.so"], container.APK) == []
+
+
+def test_cross_abi_does_not_flag_a_library_protected_on_every_abi():
+    """If both copies were injected there is no cleartext copy to read."""
+    ents = ["lib/arm64-v8a/libx.so", "lib/x86_64/libx.so"]
+    assert apk.find_cross_abi_cleartext(ents, ents, container.APK) == []
+
+
+def test_cross_abi_is_scoped_per_module_for_a_bundle():
+    """Two modules may legitimately ship different libraries under one name, so a feature
+    module's copy is NOT a cleartext counterpart of the base module's."""
+    ents = ["base/lib/arm64-v8a/libapp.so", "base/lib/x86_64/libapp.so",
+            "feat/lib/x86_64/libapp.so"]
+    got = apk.find_cross_abi_cleartext(ents, ["base/lib/arm64-v8a/libapp.so"], container.AAB)
+    assert got == [("base/lib/arm64-v8a/libapp.so", ["base/lib/x86_64/libapp.so"])]
+
+
+def test_cross_abi_ignores_non_library_entries():
+    """An APK's nested assets/lib/... is not a candidate - the APK pattern never matched it,
+    and widening the match here would reintroduce exactly what container.py keeps apart."""
+    ents = ["lib/arm64-v8a/libz.so", "assets/lib/armeabi-v7a/libz.so"]
+    assert apk.find_cross_abi_cleartext(ents, ["lib/arm64-v8a/libz.so"], container.APK) == []
+
+
+def test_cross_abi_surfaces_in_repack_result_and_report(tmp_path):
+    """End to end: the field is populated by a real pack and reaches report.json."""
+    from sopack import report
+    src = mkapk(tmp_path / "in.apk",
+                ["lib/arm64-v8a/libt.so", "lib/armeabi-v7a/libt.so"])
+    res = apk.RepackResult()
+    res.injected = [InjectResult(abi="arm64-v8a", text_rva=0, text_size=1, seg_rva=0,
+                                 entry_rva=0, strategy="DT_INIT-hijack", cipher="wbaes",
+                                 entry="lib/arm64-v8a/libt.so")]
+    with zipfile.ZipFile(src) as z:
+        ents = [i.filename for i in z.infolist()]
+    res.cross_abi_cleartext = apk.find_cross_abi_cleartext(
+        ents, [ir.entry for ir in res.injected], container.APK)
+    assert res.cross_abi_cleartext == [
+        ("lib/arm64-v8a/libt.so", ["lib/armeabi-v7a/libt.so"])]
+
+    rep = report.build(config.Config.default(), res, input_apk=src, output_apk="o.apk",
+                       exit_code=0, error=None, config_source="defaults")
+    assert rep["cross_abi_cleartext_count"] == 1
+    assert rep["cross_abi_cleartext"] == [
+        {"entry": "lib/arm64-v8a/libt.so", "cleartext_at": ["lib/armeabi-v7a/libt.so"]}]
+    # index.jsonl carries the COUNT only - the line is one os.write on an O_APPEND fd.
+    line = report.index_line(rep)
+    assert line["cross_abi_cleartext_count"] == 1
+    assert "cross_abi_cleartext" not in line

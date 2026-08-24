@@ -8,8 +8,13 @@
 # wbaes  - white-box AES-128 key wrapping (DEFAULT). The long-term key is sealed
 #          and never reconstructed at runtime, so no portable key ships. Needs the
 #          artifacts ./scripts/build_wbaes.sh produces, or a portable bundle.
-# chacha20 / xor - the freestanding stub. No build step, but the raw key ships
-#          inside the binary (whitened at rest).
+# chacha20 / xor - the freestanding stub. No build step, but NOT RECOMMENDED:
+#          the key is recoverable from the packed file with no reverse
+#          engineering. The stub is byte-identical in every app, so the key that
+#          de-whitens its metadata is a precomputable constant rather than a
+#          per-app secret, and the whitening replaces the old `SOPK` needle with
+#          a different fixed one at the same offset rather than removing it.
+#          sopack warns on every pack in this mode.
 cipher: wbaes
 
 # A list, or the string "all" for every supported ABI

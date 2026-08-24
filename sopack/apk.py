@@ -216,6 +216,51 @@ class RepackResult:
     # Which container this was, as container.Container.kind ("apk" | "aab"). Recorded so the run
     # report and the CLI's closing advice can differ without re-detecting the format.
     container: str = APK_CONTAINER.kind
+    # Protected libraries that ALSO ship, unencrypted, under an ABI this pack did not cover -
+    # in the SAME container. Each entry is (protected_entry, [cleartext_entry, ...]).
+    #
+    # This is not a warning about coverage, it is a bypass: under a static-analysis threat model
+    # an analyst reading lib/armeabi-v7a/libfoo.so gets the same code the arm64 encryption was
+    # protecting, for the cost of one unzip. Measured on a real shipped output, 20 of 21
+    # protected libraries had such a counterpart.
+    #
+    # sopack does NOT close this (that would mean protecting every ABI, or dropping them from
+    # the container - both are the operator's call, not the packer's). It reports it, so the
+    # exposure is measured on every pack instead of invisible.
+    cross_abi_cleartext: list[tuple[str, list[str]]] = field(default_factory=list)
+
+
+def find_cross_abi_cleartext(all_entries, protected, cont) -> list[tuple[str, list[str]]]:
+    """Protected libraries whose SAME BASENAME also ships unencrypted elsewhere in the container.
+
+    `all_entries` is every entry name from the input; `protected` the entries actually injected.
+    Matching is by (module, basename) so a bundle's feature module cannot be confused with the
+    base module - two modules may legitimately ship different libraries under one name.
+
+    Uses `cont.lib_re`, the container's own pattern, rather than a second path parser. That is
+    deliberate: the APK and AAB patterns are kept separate on purpose (a union would make sopack
+    start matching `assets/lib/<abi>/*.so` in APKs), and a private parser here would be a third
+    spelling of the same rule, free to drift from both.
+    """
+    protected_set = set(protected)
+    by_key: dict[tuple[str, str], list[str]] = {}
+    for name in all_entries:
+        m = cont.lib_re.match(name)
+        if not m:
+            continue
+        mod = m["mod"] if cont.has_module else ""
+        by_key.setdefault((mod, m["so"]), []).append(name)
+
+    out: list[tuple[str, list[str]]] = []
+    for name in protected:
+        m = cont.lib_re.match(name)
+        if not m:
+            continue
+        mod = m["mod"] if cont.has_module else ""
+        others = [e for e in by_key.get((mod, m["so"]), []) if e not in protected_set]
+        if others:
+            out.append((name, sorted(others)))
+    return sorted(out)
 
 
 def build_excludes(exclude_libs=None) -> tuple[str, ...]:
@@ -344,6 +389,7 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
         thin_by_slot: dict[tuple[str, str], list[str]] = {}
         with zipfile.ZipFile(in_apk, "r") as zin, \
                 zipfile.ZipFile(unsigned, "w") as zout:
+            all_input_entries = [i.filename for i in zin.infolist()]
             for item in zin.infolist():
                 name = item.filename
                 # Drop the previous signature. An APK is re-signed below; a bundle is not, and
@@ -519,6 +565,23 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                         f"{len(thin)} thin helper(s) for {abi} were staged but {pname} was not - "
                         f"every one of them DT_NEEDEDs it, so the app would fail to load. This "
                         f"is a packer bug, not a bad input.")
+
+        # Computed BEFORE the nothing-packed raises below, so it is attached to `result` on
+        # both paths - a code-6 report should still say what shipped in cleartext.
+        # `all_input_entries` is the INPUT's entry list, so helpers added during the loop can
+        # never be mistaken for a cleartext counterpart of themselves.
+        result.cross_abi_cleartext = find_cross_abi_cleartext(
+            all_input_entries, [ir.entry for ir in result.injected], cont)
+        if result.cross_abi_cleartext:
+            n = len(result.cross_abi_cleartext)
+            diag.warn(
+                f"{n} of {len(result.injected)} protected librar"
+                f"{'y' if n == 1 else 'ies'} also ship UNENCRYPTED under another ABI in this "
+                f"{cont.noun}. A static analyst can read the same code from the cleartext copy "
+                f"without touching the encryption. Widen `abis:` to cover them, or drop those "
+                f"ABIs from the input.")
+            for prot, others in result.cross_abi_cleartext:
+                diag.debug(f"cross-abi cleartext {prot}: also at {', '.join(others)}")
 
         if not matched_any:
             # `result` rides along on every one of these: it holds the accumulated per-library

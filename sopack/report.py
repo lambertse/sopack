@@ -92,6 +92,7 @@ def build(cfg, res, *, input_apk, output_apk, exit_code, error, config_source,
         "encrypted_count": len(injected),
         "failed_count": len(failed),
         "not_selected_count": len(untouched),
+        "cross_abi_cleartext_count": len(getattr(res, "cross_abi_cleartext", []) or []),
         # None (not False) when we never got as far as signing, so a consumer can tell "left
         # unsigned" apart from "never reached that stage".
         "signed": getattr(res, "signed", None) if res is not None else None,
@@ -108,6 +109,15 @@ def build(cfg, res, *, input_apk, output_apk, exit_code, error, config_source,
         ],
         "failed": [{"entry": e, "reason": r} for e, r in failed],
         "not_selected": [{"entry": e, "reason": r} for e, r in untouched],
+        # Protected libraries that ALSO ship unencrypted under another ABI in the same
+        # container. Additive key, so SCHEMA does not move: a reader that does not look for it
+        # is unaffected, and no existing key changed meaning (the same reasoning that let
+        # `container` be added). Read together with per_abi: a high count here means the pack
+        # succeeded and the protection is bypassable anyway.
+        "cross_abi_cleartext": [
+            {"entry": e, "cleartext_at": o}
+            for e, o in (getattr(res, "cross_abi_cleartext", []) or [])
+        ],
         "per_abi": per_abi,
         # Caveats that leave a usable output but change what the artifact IS - an unsigned APK,
         # libraries that shipped in cleartext. Those are exit-0 successes, so without this a
@@ -143,6 +153,10 @@ def index_line(report: dict) -> dict:
         "abis": report.get("abis"),
         "encrypted_count": report.get("encrypted_count"),
         "failed_count": report.get("failed_count"),
+        # A scalar, never the array: index.jsonl lines are appended with a single os.write on
+        # an O_APPEND fd, so they must stay small and bounded. The per-library detail is in
+        # report.json.
+        "cross_abi_cleartext_count": report.get("cross_abi_cleartext_count"),
         "not_selected_count": report.get("not_selected_count"),
         "signed": report.get("signed"),
         "warning_count": len(report.get("warnings") or ()),
