@@ -2,8 +2,8 @@
 #
 # check_obfuscated.sh - decide, FROM THE ARTIFACT, whether O-MVLL ran on sopack's own code.
 #
-#   ./scripts/check_obfuscated.sh --mode text   [--min N] <sopk_rt_*.so>
-#   ./scripts/check_obfuscated.sh --mode symbol [--min N] [--symbol S] <libsopk_wb.so>
+#   ./scripts/check_obfuscated.sh --mode symbol [--symbol S] <artifact.so>   # THE GATE, pre-strip
+#   ./scripts/check_obfuscated.sh --mode text   [--min N]  <sopk_rt_*.so>    # advisory, post-strip
 #
 # Exit 0 = obfuscated (prints the measurement), 1 = demonstrably NOT, 2 = cannot tell.
 # EXIT 2 IS NEVER A PASS. A caller that records "obfuscated" on a 2 is lying with extra steps.
@@ -17,43 +17,51 @@
 #   when the unstripped helper shipped. Nothing refused one." So: refuse one.
 #
 # HOW THE SIGNAL WAS CHOSEN (all measured on this repo's toolchain, not assumed)
-#   Control-flow flattening + break_control_flow + MBA on one function:
+#   The first three attempts all thresholded on a NUMBER, and every one of them was wrong.
+#
+#   Attempt 1 - conditional branches. Flattening + break_control_flow + MBA on one function:
 #       plain        32 instructions,  4 conditional branches
 #       obfuscated  441 instructions, 11 conditional branches
-#   Instructions grew 13.8x; conditional branches only 2.75x, and branch DENSITY actually fell
-#   (12.5% -> 2.5%) because flattening dispatches through computed branches. An earlier version
-#   of this script thresholded on branch count; it would have been close to useless. Code growth
-#   is the signal.
+#   Instructions grew 13.8x; conditional branches only 2.75x, and branch DENSITY actually FELL
+#   (12.5% -> 2.5%), because flattening dispatches through computed branches. A branch-count
+#   gate would have been close to useless.
 #
-#   Two further findings shape the two modes:
+#   Attempt 2 - a symbol's st_size. Not a measure at all: O-MVLL outlines the body into a
+#   sibling, so `sopk_wb_k` went 128 -> 56 bytes plus a new `sopk_wb_k.1` of 1708. Measured
+#   naively, the obfuscated function looks SMALLER than the plain one.
 #
-#   1. A symbol's st_size is NOT a reliable measure. O-MVLL outlines the body into a sibling
-#      (`sopk_wb_k` 128 -> 56 bytes, plus a new `sopk_wb_k.1` of 1708). Measured naively, an
-#      obfuscated function looks SMALLER than a plain one. Mode `symbol` therefore sums the
-#      whole family: SYMBOL plus SYMBOL.* .
-#   2. Those outlined siblings are LOCAL symbols, so `llvm-strip --strip-all` deletes them.
-#      Mode `symbol` only works BEFORE the strip. Call it there.
+#   Attempt 3 - an instruction-count floor on the thin helper's whole .text. This one shipped,
+#   and it hard-failed a real container build. The SAME SOURCE measures:
+#       613    plain
+#       712    O-MVLL 1.9.1, with a config method name the plugin does not dispatch (a no-op)
+#      1247    O-MVLL 1.6.0, same dead name  (the no-op still perturbs codegen)
+#      2223    O-MVLL 1.6.0, flatten_cfg     (the name that actually works)
+#   Four numbers spanning 3.6x for one file, moved by the PLUGIN VERSION and by ONE STRING in
+#   the config. No floor calibrated on one toolchain survives another.
+#
+#   THE SIGNAL THAT WORKS IS STRUCTURAL, NOT NUMERIC. O-MVLL splits every function it
+#   transforms into `name` plus `name.1`, `name.2`, ... Presence of a `.N` sibling is binary,
+#   needs no per-symbol calibration, and holds across plugin versions. That is `--mode symbol`,
+#   and it is the only mode any gate uses.
+#
+#   Caveat that decides WHERE it runs: outlined siblings are LOCAL symbols, so
+#   `llvm-strip --strip-all` deletes them. Mode `symbol` only works BEFORE the strip.
 #
 # WHICH MODE FOR WHICH ARTIFACT
-#   thin helper  sopk_rt_<abi>.so  -> --mode text. Its .text is 100% sopack's code (it links no
-#                                    white-box at all), so whole-.text instruction count is a
-#                                    clean proxy AND survives stripping.
+#   provider  libsopk_wb.so     -> --mode symbol, PRE-STRIP. Whole-.text would drown
+#                                  sopk_wb_k's 136 instructions in ~75,602 vendored ones.
+#   helper    sopk_rt_<abi>.so  -> --mode symbol --symbol sopk_rt_ctor, PRE-STRIP. Measured:
+#                                      plain       sopk_rt_ctor self_cb tgt_cb sopk_wipe   (4)
+#                                      obfuscated  ...plus sopk_rt_ctor.1 self_cb.2 ...    (8)
+#   Both gates live in build_wbaes.sh, which keeps an unstripped copy for exactly this.
 #
-#                                    BOTH SIDES MEASURED on real artifacts:
-#                                        plain        613 instructions
-#                                        obfuscated  1537 instructions   (2.5x)
-#
-#                                    Only 2.5x, not the 8-14x a single function shows, because
-#                                    much of the helper's .text is libc glue (__on_dlclose,
-#                                    atexit, pthread_atfork, __clear_cache) that the config
-#                                    correctly does not touch. The floor is 1000 - comfortably
-#                                    above plain, comfortably below obfuscated. An earlier
-#                                    version guessed 1500 from the plain side alone, which the
-#                                    real obfuscated build clears by 37 instructions; that would
-#                                    have hard-failed builds on any pass-set change.
-#   provider     libsopk_wb.so     -> --mode symbol, BEFORE stripping. Its .text is 75,602
-#                                    instructions, almost all vendored libwbcrypto, so whole-
-#                                    .text would drown sopk_wb_k's 136 entirely.
+#   --mode text is ADVISORY ONLY and no longer gates anything. It counts whole-.text
+#   instructions against a floor, which is attempt 3 above; it survives stripping, which is why
+#   artifact_generation.sh still runs it over an already-stripped bundled helper - and treats a
+#   FAILURE as a warning, because the floor is uncalibratable across toolchains and
+#   build_wbaes.sh already ran the authoritative pre-strip check. Do not promote it back to a
+#   gate.
+
 set -euo pipefail
 
 MODE=""; TARGET=""; SYMBOL="sopk_wb_k"; MIN=""
@@ -67,11 +75,12 @@ while [ "$#" -gt 0 ]; do
         *)  TARGET="$1"; shift ;;
     esac
 done
-[ -n "$TARGET" ] || { echo "usage: $0 --mode text|symbol <artifact.so>" >&2; exit 2; }
+[ -n "$TARGET" ] || { echo "usage: $0 --mode symbol [--symbol S] <artifact.so>   (pre-strip; the gate)
+       $0 --mode text [--min N] <artifact.so>     (post-strip; advisory only)" >&2; exit 2; }
 [ -f "$TARGET" ] || { echo "no such file: $TARGET" >&2; exit 2; }
 case "$MODE" in
     text|symbol) ;;
-    *) echo "--mode must be 'text' (thin helper) or 'symbol' (provider, pre-strip)" >&2; exit 2 ;;
+    *) echo "--mode must be 'symbol' (the gate; pre-strip) or 'text' (advisory; post-strip)" >&2; exit 2 ;;
 esac
 
 find_tool() {   # find_tool NAME -> path, preferring the NDK's copy
@@ -115,7 +124,11 @@ READELF="$(find_tool readelf || true)"
        \$NDK/toolchains/llvm/prebuilt/<host>/bin/llvm-readelf." >&2; exit 2; }
 
 if [ "$MODE" = "text" ]; then
-    : "${MIN:=1000}"   # between the measured 613 (plain) and 1537 (obfuscated)
+    # ADVISORY MODE - see the header. The floor sits between 613 (plain) and the lowest
+    # obfuscated figure ever measured here, but "lowest ever measured" is not a property of
+    # the next toolchain: the same source has read 613 / 712 / 1247 / 2223. Callers must treat
+    # a failure here as a warning; build_wbaes.sh --mode symbol is what refuses a build.
+    : "${MIN:=1000}"
     OBJDUMP="$(find_tool objdump || true)"
     [ -n "$OBJDUMP" ] || { echo "cannot verify obfuscation: no objdump available (unknown)." >&2; exit 2; }
     INSNS="$("$OBJDUMP" -d --section=.text "$TARGET" 2>/dev/null | grep -cE '^[[:space:]]*[0-9a-f]+:' || true)"
@@ -130,7 +143,9 @@ if [ "$MODE" = "text" ]; then
     if [ "$INSNS" -lt "$MIN" ]; then
         echo "$(basename "$TARGET") has $INSNS .text instructions (floor $MIN) - UNOBFUSCATED.
        Its .text is entirely sopack's own code, so this is a direct measurement, not a proxy.
-       Measured on real artifacts: 613 instructions plain, 1537 obfuscated.
+       ADVISORY: this floor is not calibratable across toolchains (the same source has read
+       613 / 712 / 1247 / 2223 depending on plugin version and one config method name), so a
+       caller should WARN on this, not die. build_wbaes.sh --mode symbol is the real gate.
        Check that scripts/fetch_omvll.sh vendored a plugin, that stub/omvll_config_wb.py
        exists, and that the plugin actually LOADED - clang reports an unloadable pass-plugin
        once per translation unit, so the real error hides in the wall of output." >&2
@@ -140,7 +155,7 @@ if [ "$MODE" = "text" ]; then
     exit 0
 fi
 
-# --- mode symbol: outlining siblings in .symtab, PRE-STRIP ---------------------------------
+# --- mode symbol: outlining siblings in .symtab, PRE-STRIP - THIS IS THE GATE ---------------
 #
 # The signal is STRUCTURAL, not a size threshold, and that is deliberate. O-MVLL splits every
 # function it transforms into `name` plus `name.1`, `name.2`, ... Measured on the thin helper:

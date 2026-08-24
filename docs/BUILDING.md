@@ -278,7 +278,22 @@ bundle. Two Linux-specific notes:
 O-MVLL itself is vendored by `scripts/fetch_omvll.sh` into `third_party/omvll/` (sopack owns
 that pin; the submodule keeps a copy only as its standalone fallback) and is applied to BOTH the
 vendored `libwbcrypto.a` and sopack's own `sopk_wb.c`/`sopk_rt.c`. `scripts/check_obfuscated.sh`
-then verifies from the artifact that it actually ran.
+then verifies **from the artifact** that it actually ran, and `build_wbaes.sh` dies if it did
+not. Three things about that gate are worth knowing before you hit them:
+
+- **`$NDK` must be set** (or `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT`). The check aborts without
+  it rather than falling back, because only the NDK's `llvm-readelf`/`llvm-objdump` can read an
+  Android `.so`; a container's host binutils `objdump` is x86_64-only and reports an aarch64
+  library as *zero instructions*, which is indistinguishable from a real failure.
+- **It runs pre-strip.** The evidence is O-MVLL's outlined `name.1`/`name.2` siblings, which are
+  LOCAL symbols that `llvm-strip --strip-all` removes. `build_wbaes.sh` keeps an unstripped copy
+  for exactly this. The post-strip re-check in `artifact_generation.sh` is coarse and only
+  **warns**.
+- **Exit 2 means "cannot tell" and is never a pass.**
+
+See [`STATIC-ANALYSIS-REVIEW.md`](./technical/STATIC-ANALYSIS-REVIEW.md) for why the signal is
+structural rather than an instruction-count threshold — three numeric designs were tried and all
+three were wrong, one of them after it shipped.
 
 `--allow-unobfuscated-provider` builds `libsopk_wb.so` without O-MVLL. It is never implied — not
 by the host, not by a plugin that failed to load — and it is recorded as

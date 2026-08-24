@@ -510,9 +510,12 @@ cp build-android/libwbcrypto.a include/wbcrypto.h "$SOPACK/vendor/wbc/"
 CXX="$NDK/toolchains/llvm/prebuilt/$(uname | tr A-Z a-z)-x86_64/bin/clang++"
 # (on Apple Silicon the prebuilt dir is still darwin-x86_64)
 
+printf '{ global: sopk_wb_k; local: *; };\n' > /tmp/provider.map
+
 "$CXX" --target=aarch64-linux-android24 -fPIC -shared -O2 -g0 \
     -ffile-prefix-map="$WBC=." -ffile-prefix-map="$SOPACK=." \
     -fvisibility=hidden -Wl,--exclude-libs,ALL -Wl,--no-undefined \
+    -Wl,--version-script=/tmp/provider.map \
     -Wl,-soname,libsopk_wb.so \
     -static-libstdc++ \
     -I"$WBC/include" -I"$SOPACK/stub" \
@@ -558,15 +561,30 @@ Six things about that link line, all load-bearing:
   them. Without it the provider advertises `wbc_open`/`wbc_unwrap_key` in its dynamic symbol
   table, which hands a reverser a labelled map of the scheme.
 
-  If check P3 below prints more than `sopk_wb_k`, `--exclude-libs` did not take effect (its
-  coverage has varied across lld versions). Use a version script instead - it works regardless
-  of where the visibility came from, because it filters at link time:
+- **The version script is MANDATORY when O-MVLL is on, not a fallback.** `-fvisibility=hidden`
+  is a *compile-time* attribute, and **O-MVLL promotes the linkage of every function it
+  transforms**, so a hidden-by-default function comes out of the pass exported. This is not
+  theoretical: the first obfuscated provider shipped exporting `sopk_rt_ctor`, `self_cb`,
+  `tgt_cb` and `sopk_wipe` - i.e. O-MVLL undid exactly the hiding that Method 5 and
+  `--exclude-libs` exist to provide, and handed a reverser a labelled map of the scheme it was
+  supposed to be obfuscating. A version script filters at **link** time, after the pass has run,
+  so it is the only control that survives:
 
   ```bash
-  printf '{ global: sopk_wb_k; local: *; };\n' > /tmp/only-entry.map
-  # ...add to the clang++ line, alongside or instead of --exclude-libs:
-  #   -Wl,--version-script=/tmp/only-entry.map
+  printf '{ global: sopk_wb_k; local: *; };\n' > /tmp/provider.map   # 4a: exactly one export
+  printf '{ local: *; };\n'                    > /tmp/hide-all.map   # 4b: no exports at all
   ```
+
+  `scripts/build_wbaes.sh` writes both unconditionally and passes them on every link, obfuscated
+  or not - a conditional would make the export set depend on `--omvll`, and the packer's soname
+  and export assertions have to hold either way. Check P3 below is what catches a regression: if
+  it prints **more** than `sopk_wb_k` the script did not take effect; if it prints **nothing**,
+  the script swallowed the entry point and every packed app will fail to resolve it at load.
+  Both are hard errors in `build_wbaes.sh`.
+
+  (`--exclude-libs,ALL` still belongs on the line: it covers the `wbc_*` symbols, whose
+  `visibility("default")` is baked into `libwbcrypto.a`'s objects and cannot be removed by any
+  flag on *this* compile. The two controls cover different sources of unwanted exports.)
 
 - **`-Wl,-soname,libsopk_wb.so` is load-bearing, not tidiness.** The thin helper's `DT_NEEDED`
   string is whatever the linker recorded here. Without an explicit soname, lld records the file
@@ -593,6 +611,7 @@ CC="$(dirname "$CXX")/clang"
 "$CC" --target=aarch64-linux-android24 -fPIC -shared -O2 -g0 \
     -ffile-prefix-map="$SOPACK=." \
     -fvisibility=hidden -Wl,--no-undefined \
+    -Wl,--version-script=/tmp/hide-all.map \
     -I"$SOPACK/stub" \
     "$SOPACK/stub/sopk_rt.c" \
     "$SOPACK/sopack/stubs/sopk_wb_arm64-v8a.so" \
@@ -602,12 +621,31 @@ CC="$(dirname "$CXX")/clang"
 ```
 
 The thin helper exports nothing by design - its only entry point is an ELF constructor, which
-the loader reaches through `DT_INIT_ARRAY`, not the symbol table. No `-llog` on either artifact
+the loader reaches through `DT_INIT_ARRAY`, not the symbol table. **With O-MVLL on, that
+requires `/tmp/hide-all.map`**: see 4a's version-script note - the pass promotes linkage and
+`-fvisibility=hidden` alone does not hold. No `-llog` on either artifact
 unless you also pass `-DSOPK_RT_LOG` (Phase 6).
 
 **Keep the thin helper under the same O-MVLL flags as the provider.** Otherwise every packed app
 ships an identical un-obfuscated copy of the decrypt-and-place dance - a hardening regression
-versus the pre-v3 single artifact.
+versus the pre-v3 single artifact. The policy file is `stub/omvll_config_wb.py` (sopack's own -
+WBC's names `vm.cpp`/`trusted_storage.cpp` and would match nothing here, loading cleanly and
+transforming nothing). **Check its method names against the plugin's actual API**: O-MVLL
+dispatches by exact name and silently ignores one it does not know, which is how `flatten_cfg`
+spent a release misspelled as `flatten_functions` with flattening never running at all - see
+[`STATIC-ANALYSIS-REVIEW.md`](./STATIC-ANALYSIS-REVIEW.md) S8.
+
+**Verify from the artifact, not from the flags.** Run, before the strip (O-MVLL's outlined
+`name.1` siblings are LOCAL symbols the strip deletes):
+
+```bash
+NDK=$NDK ./scripts/check_obfuscated.sh --mode symbol                       <unstripped provider.so>
+NDK=$NDK ./scripts/check_obfuscated.sh --mode symbol --symbol sopk_rt_ctor <unstripped helper.so>
+```
+
+Exit 0 = O-MVLL demonstrably ran, 1 = demonstrably did not, 2 = cannot tell (**never** a pass).
+`$NDK` is required - only the NDK's `llvm-readelf`/`llvm-objdump` can read an Android `.so`.
+`build_wbaes.sh` runs both automatically and dies on 1.
 
 This is the RELEASE line, and it is the default for a reason. Built without `-g0` and the
 strip, these carry megabytes of DWARF naming `sopk_rt_ctor`, the whole `wbc_*` API and the VM

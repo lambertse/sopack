@@ -73,11 +73,29 @@ bash stub/build_stubs.sh --with-log         # ...WITH logcat support compiled in
                                             #   SOPACK owns this pin now (not the WBC submodule):
                                             #   a pass-plugin only loads into the clang it was
                                             #   built against, and sopack owns the NDK pin.
+                                            #   $SOPACK_OMVLL_DIR / --dir relocate the vendor dir.
+# THE obfuscation gate. Decides FROM THE ARTIFACT whether O-MVLL ran on sopack's own code.
+# $NDK REQUIRED (hard abort, not a fallback): only the NDK's llvm-readelf/llvm-objdump can read
+# an Android .so - a host binutils objdump is x86_64-only and reads an aarch64 lib as ZERO
+# instructions, which is indistinguishable from a real failure.
+NDK=$NDK ./scripts/check_obfuscated.sh --mode symbol                       <provider.so>
+NDK=$NDK ./scripts/check_obfuscated.sh --mode symbol --symbol sopk_rt_ctor <helper.so>
+                                            #   PRE-STRIP ONLY. The signal is STRUCTURAL: O-MVLL
+                                            #   splits what it transforms into name.1/name.2...,
+                                            #   which are LOCAL symbols --strip-all deletes.
+                                            #   build_wbaes.sh keeps SKEL_UNSTRIPPED for this and
+                                            #   DIES on exit 1. Exit 2 = "cannot tell", never a
+                                            #   pass.
+                                            #   NOT a threshold, deliberately: the same source
+                                            #   measured 613/712/1247/2223 .text instructions
+                                            #   across plugin versions and ONE config method
+                                            #   name, so no floor transfers between toolchains.
 ./scripts/check_obfuscated.sh --mode text  sopack/stubs/sopk_rt_<abi>.so
-./scripts/check_obfuscated.sh --mode symbol <provider.so>   # PRE-strip only
-                                            #   Decides FROM THE ARTIFACT whether O-MVLL ran on
-                                            #   sopack's own code. Exit 2 = "cannot tell", which
-                                            #   is never a pass.
+                                            #   ADVISORY ONLY, and gates nothing. The superseded
+                                            #   instruction floor; it survives stripping, so
+                                            #   artifact_generation.sh runs it over the bundled
+                                            #   (already stripped) helper and only WARNS. Do not
+                                            #   promote it back to a gate.
 
 # Harness scripts (see "Directory layout" below for how these directories differ)
 ./scripts/device_test.sh [--only PAT]       # pack every test_apks/*.apk with wbaes, install and
@@ -901,6 +919,28 @@ two things that were actually macOS-specific have both been fixed rather than wo
   a coupled pair is how they drift. The plugin is applied to the vendored `libwbcrypto.a` AND to
   sopack's own `sopk_wb.c`/`sopk_rt.c`; it used to reach only the former while `MANIFEST.txt`
   claimed otherwise. `scripts/check_obfuscated.sh` now verifies that from the artifact.
+
+**Two ways to get an unobfuscated artifact out of a successful build, and both are now gated.**
+The first is a plugin that fails to load. The second is subtler and shipped: **O-MVLL's
+`ObfuscationConfig` dispatches by EXACT method name and silently ignores one it does not know** -
+no warning, no log line, no non-zero exit. `stub/omvll_config_wb.py` spelled flattening
+`flatten_functions` (the real name is `flatten_cfg`) and three more names that exist in no
+version, so the strongest transform never ran while every flag and manifest field said it did.
+Measured, same source and plugin, one string changed: 1247 -> 2223 `.text` instructions. WBC's
+own `omvll_config.py` has the identical bug, flagged in place rather than fixed (turning four
+dormant passes on at once is its own change). The valid set, identical in 1.6.0 and 1.9.1:
+`obfuscate_arithmetic`, `flatten_cfg`, `obfuscate_string`, `indirect_call`, `break_control_flow`,
+`function_outline`, `basic_block_duplicate`. `tests/test_obfuscate.py` AST-walks both sopack
+configs against it.
+
+**O-MVLL PROMOTES THE LINKAGE of every function it transforms**, so `-fvisibility=hidden` does
+not survive the pass and an obfuscated thin helper exports `sopk_rt_ctor`/`self_cb`/`tgt_cb`/
+`sopk_wipe` - obfuscation handing a reverser the labelled map it was meant to remove. Both wbaes
+link lines therefore carry a **version script**, written unconditionally by `build_wbaes.sh`
+(`{ global: sopk_wb_k; local: *; };` for the provider, `{ local: *; };` for the helper).
+Unconditional on purpose: making the export set depend on `--omvll` would make the packer's
+soname/export assertions hold only in one mode. `--exclude-libs,ALL` stays too - it covers the
+`wbc_*` symbols, whose `visibility("default")` is baked into `libwbcrypto.a`'s objects.
 
 `docker/` builds the Linux bundle in a `linux/amd64` image; see `docker/README.md`. Not a
 preference: Google publishes no `linux-aarch64` NDK toolchain and the O-MVLL Linux plugin is

@@ -16,7 +16,7 @@ Every finding below was **reproduced against real shipped artifacts in this repo
 `artifacts/vsa-encrypted.aab`, `out/bundle/stubs/*`), not derived from reading source.
 
 **Outcome.** The cryptographic core is sound and the documentation is unusually candid. But three
-of the seven findings **bypass the crypto rather than break it**, and one shipped security claim
+of the eight findings **bypass the crypto rather than break it**, and one shipped security claim
 did not describe the artifact it labelled.
 
 ---
@@ -47,11 +47,12 @@ Stated first because it shapes everything below, and because these must not be r
 |---|---|---|---|---|
 | S1 | **Critical** | Cross-ABI cleartext: 20 of 21 protected libraries ship unencrypted in the same APK | Yes — entirely | Reported, not closed (accepted risk) |
 | S2 | **Critical** | `chacha20`/`xor` has a universal unpacker needing **zero** reverse engineering | Yes — key is a build constant | Warned; polymorphic stub is the durable fix |
-| S3 | **High** | O-MVLL did not cover sopack's own code, but `MANIFEST.txt` said it did | Mislabelled control | **Fixed** |
+| S3 | **High** | O-MVLL did not cover sopack's own code, but `MANIFEST.txt` said it did | Mislabelled control | **Fixed** — but see S8 |
 | S4 | **High** | The freestanding stub — which holds the whole recipe — is unobfuscated | Enables S2 | Deferred to the polymorphic stub |
 | S5 | Medium | A tracing helper narrating the protocol in plaintext reached a real output APK | Yes, when triggered | Hardened |
 | S6 | Medium | Target inventory published in the ZIP listing; constant helper size | Targeting aid | Open (low priority) |
 | S7 | Low | Gratuitous literals: log strings, `WHITEN_NONCE`, NDK build-id, libsodium strings | Fingerprinting | Partly fixed |
+| S8 | **High** | Four O-MVLL config methods name passes that do not exist, so the strongest transform never ran — in sopack's config *and* in WBC's | Mislabelled control | **Fixed** in sopack; documented in WBC |
 
 ---
 
@@ -214,6 +215,11 @@ records `omvll-version` + `omvll-sha256`.
 Most importantly, the claim is now **checkable**: `scripts/check_obfuscated.sh` measures the
 artifact and `build_wbaes.sh` refuses a build that claims obfuscation it cannot demonstrate.
 
+**That checkability immediately earned itself.** The first version of the fix wired the plugin
+in correctly and was still close to a no-op, because the policy file named a pass that does not
+exist — see **S8**. Read S3 and S8 together: "the plugin now reaches our code" and "the plugin
+now transforms our code" are two separate claims, and only the second one is what anybody wanted.
+
 ---
 
 ## S4 — The freestanding stub is entirely unobfuscated  **[High]**
@@ -311,6 +317,60 @@ byte-scan and being recognisable is its job).
 
 ---
 
+## S8 — An obfuscation config that names passes which do not exist  **[High]** — FIXED
+
+`ObfuscationConfig` dispatches by **exact method name** and **silently ignores a name it does not
+know**. There is no warning, no log line, no non-zero exit. A policy file can therefore declare a
+transform, be loaded successfully, and do nothing.
+
+Four of the method names in use were exactly that:
+
+| Name written | Real name | Effect |
+|---|---|---|
+| `flatten_functions` | `flatten_cfg` | **control-flow flattening never ran** |
+| `obfuscate_constants` | — (no such pass) | never ran |
+| `obfuscate_struct_access` | — (no such pass) | never ran |
+| `anti_hooking` | — (no such pass) | never ran |
+
+Verified against both O-MVLL **1.6.0** and **1.9.1**: the dispatched set is exactly
+`obfuscate_arithmetic`, `flatten_cfg`, `obfuscate_string`, `indirect_call`, `break_control_flow`,
+`function_outline`, `basic_block_duplicate`. The four names above are in neither version.
+
+Measured A/B on `sopk_rt_arm64-v8a.so` — same source, same plugin, one string changed:
+
+```
+plain                              613 .text instructions
+with flatten_functions  (a no-op) 1247
+with flatten_cfg                  2223
+```
+
+So the config was buying **1247 instead of 2223**, and the growth it did show came from the other
+three passes plus incidental codegen churn — enough to look like it was working.
+
+**This is the review's own thesis turning on the review's own fix.** S3 was a control that
+*claimed* to be present while absent. S8 is a control that was *genuinely wired in*, loaded
+without error, and still absent — a strictly harder failure to notice, because every observable
+signal short of measuring the artifact says PASS.
+
+**Two consequences worth carrying forward:**
+
+- **The same bug is in WBC's own `third_party/omvll/omvll_config.py`**, which means flattening has
+  never run on the white-box VM either. It is flagged in place on the `feat/omvll-as-input`
+  branch rather than corrected: turning four dormant passes on at once is a behaviour change with
+  recorded Register-Coalescer and anti-hooking hazards, and it belongs in its own change with its
+  own device run.
+- **This is why the obfuscation gate is structural.** The dead name is what produced the 712
+  figure that hard-failed a real container build against an instruction floor — see the note at
+  the end of this document. A numeric gate cannot separate "wrong plugin version" from "dead
+  config method"; an outlined-sibling check separates "the pass ran" from "the pass did not" and
+  nothing else.
+
+`tests/test_obfuscate.py::test_omvll_configs_use_method_names_the_plugin_actually_dispatches`
+AST-walks both sopack config files against the known-valid method set, so a fifth dead name
+cannot be added silently.
+
+---
+
 ## Repo hygiene — clean
 
 `out/`, `output/`, `test_apks/`, `vendor/`, `artifacts/` and `*.apk` are gitignored; only four
@@ -323,11 +383,11 @@ committing them changes nothing material.
 ## A note on how the obfuscation gate was calibrated
 
 `scripts/check_obfuscated.sh` exists because of S3: a claim that cannot be checked eventually
-lies. Its threshold was **measured, not assumed**, and the first attempt was wrong in an
-instructive way.
+lies. Its **first three designs were all wrong**, in ways worth recording, because each one looked
+reasonable and two of them shipped.
 
-Building one function with and without O-MVLL (NDK r26d + O-MVLL 1.6.0, flattening +
-control-flow-breaking + MBA):
+**Attempt 1 — count conditional branches.** Building one function with and without O-MVLL
+(flattening + control-flow-breaking + MBA):
 
 ```
 plain        32 instructions,   4 conditional branches
@@ -335,20 +395,52 @@ obfuscated  441 instructions,  11 conditional branches
 ```
 
 Instruction count grew **13.8x**; conditional branches only **2.75x**, and branch *density* fell
-(12.5% → 2.5%) because flattening dispatches through computed branches. A gate thresholded on
-branch count — the intuitive choice — would have been close to useless.
+(12.5% → 2.5%), because flattening dispatches through computed branches. The intuitive signal was
+the near-useless one.
 
-Two further measurements forced the final design:
+**Attempt 2 — a symbol's `st_size`.** Not a measure at all. O-MVLL outlines the body into a
+sibling: `sopk_wb_k` went 128 → 56 bytes plus a new `sopk_wb_k.1` of 1708. Measured naively, the
+obfuscated function looks **smaller**.
 
-- **A symbol's `st_size` is not a reliable measure.** O-MVLL outlines the body into a sibling:
-  `sopk_wb_k` went 128 → 56 bytes plus a new `sopk_wb_k.1` of 1708. Measured naively, the
-  obfuscated function looks *smaller*.
-- **Those siblings are LOCAL symbols**, so `--strip-all` deletes them. The provider can only be
-  checked *before* stripping.
+**Attempt 3 — an instruction-count floor over the thin helper's whole `.text`.** This one shipped,
+and it hard-failed a real container build on a correctly-configured machine. The same source file
+measures:
 
-Hence two modes: `--mode symbol` sums the `sopk_wb_k` family pre-strip (the provider's whole
-`.text` is no substitute — 75,602 of its ~75,738 instructions are vendored libwbcrypto), and
-`--mode text` counts the thin helper's whole `.text`, which works stripped because the helper
-links no white-box and is therefore 100% sopack's own code (measured plain: 613 instructions).
+```
+ 613    plain
+ 712    O-MVLL 1.9.1, config method name the plugin does not dispatch   (S8)
+1247    O-MVLL 1.6.0, same dead name
+2223    O-MVLL 1.6.0, flatten_cfg
+```
+
+Four numbers spanning **3.6x** for one file, moved by the *plugin version* and by *one string in a
+config*. No floor calibrated on one toolchain survives the next, and a floor cannot tell "plugin
+did not load" from "plugin loaded, pass name is dead" from "different plugin version, same work
+done" — three situations demanding three different answers.
+
+**What works is structural.** O-MVLL splits every function it transforms into `name` plus
+`name.1`, `name.2`, … Presence of a `.N` sibling is binary, needs no per-symbol calibration, and
+holds across plugin versions:
+
+```
+plain        sopk_rt_ctor  self_cb  tgt_cb  sopk_wipe                    (4 symbols, no .N)
+obfuscated   ...plus sopk_rt_ctor.1  self_cb.2  tgt_cb.3  sopk_wipe.4    (8 symbols)
+```
+
+A byte floor could not have served both artifacts either: a plain `sopk_rt_ctor` is 1704 bytes and
+a plain `sopk_wb_k` is 544, so any single threshold passes the unobfuscated helper or fails the
+obfuscated provider. The sibling count needs no threshold at all.
+
+**Where it runs, and the one caveat.** Outlined siblings are **LOCAL** symbols, so
+`llvm-strip --strip-all` deletes them — the check must run **before** the strip.
+`build_wbaes.sh` keeps an unstripped copy for exactly this and gates both artifacts
+(`--mode symbol` on `sopk_wb_k`, and on `sopk_rt_ctor`); a failure **dies**. `--mode text`
+(attempt 3) survives; it is **advisory only**, run by `artifact_generation.sh` over the already-
+stripped bundled helper, where a failure is a **warning** that defers to the pre-strip gate.
+
+**`$NDK` is required**, and its absence is a hard error rather than a fallback: the tools that can
+disassemble an Android `.so` are the NDK's `llvm-readelf`/`llvm-objdump`. A container's host
+binutils `objdump` is x86_64-only and reads an aarch64 `.so` as *zero instructions* — which an
+earlier version reported as "cannot tell" from a machine that was otherwise fine.
 
 Exit 2 means "cannot tell" and is **never** treated as a pass.

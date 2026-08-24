@@ -75,8 +75,18 @@ docker run --rm --platform linux/amd64 -v "$PWD:/workspace" -v "$PWD/out:/out" \
       cd /workspace && ./scripts/build_wbaes.sh --abi arm64-v8a --api 24'
 ```
 
-Expect `Host phases 1-4 PASS`. If the plugin fails to load, it fails here, in Phase 4, and the
-fallback is `--allow-unobfuscated-provider` on the real run below.
+Expect `Host phases 1-4 PASS`, including two lines reading
+`O-MVLL demonstrably ran (... N outlined ...)` — one for the provider, one for the thin helper.
+Those come from `scripts/check_obfuscated.sh`, which measures the built artifact instead of
+trusting the flag, and Phase 4 **dies** if it reports the artifact is unobfuscated. If the plugin
+fails to load, it fails here, and the fallback is `--allow-unobfuscated-provider` on the real run
+below.
+
+**`$NDK` must be set for that check to run.** The image sets it (`ENV NDK=/opt/android-ndk-r29`),
+so this only bites if you override the entrypoint *and* the environment. Without it the check
+aborts with a message naming the variable — it deliberately does **not** fall back to the
+container's `objdump`, which is x86_64-only and reads an aarch64 `.so` as zero instructions,
+i.e. reports "cannot tell" on a machine that is actually fine.
 
 **2. A full bundle.**
 
@@ -151,5 +161,9 @@ so O-MVLL loads; the bundle stays distro-agnostic because its only native binary
 "fix" a target-side glibc complaint by changing the base — check gate 4 instead.
 
 Bumping the NDK means bumping the O-MVLL pin in `scripts/fetch_omvll.sh` too, or the plugin stops loading —
-and a plugin that fails to load is the one way to get an unobfuscated provider out of a build
-that otherwise looks successful.
+and a plugin that fails to load *used to be* the one way to get an unobfuscated provider out of a
+build that otherwise looks successful. It is now caught: `check_obfuscated.sh` runs on every
+build. Note the **second** way, which the same check exists to catch — a plugin that loads fine
+while the policy file names a pass that does not exist. `ObfuscationConfig` dispatches by exact
+method name and ignores an unknown one in silence; see
+[`STATIC-ANALYSIS-REVIEW.md`](../docs/technical/STATIC-ANALYSIS-REVIEW.md) S8.

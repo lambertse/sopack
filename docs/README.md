@@ -39,6 +39,13 @@ stub, or the white-box integration; you do not need them to use the tool.
 - **[technical/HARDENING.md](./technical/HARDENING.md)** - the implementation of every
   anti-static-analysis technique (metadata whitening, string hygiene, the pack-time strip, and
   why section-header stripping was rejected), with the code and the tests that lock each one.
+- **[technical/STATIC-ANALYSIS-REVIEW.md](./technical/STATIC-ANALYSIS-REVIEW.md)** - the review
+  those techniques answer to. Eight findings (S1-S8), every one reproduced against a real
+  shipped artifact in this repo rather than derived from reading source, each with its
+  reproduction and its current status. Read it to know what sopack actually costs an analyst
+  who never runs the app - including the two findings that are measured and reported rather
+  than closed, and why. It also records how the obfuscation gate was calibrated, which is the
+  short version of "do not replace a structural check with a threshold".
 - **[technical/IMPROVEMENTS.md](./technical/IMPROVEMENTS.md)** - changes that are understood
   and deliberately **not** done, each with the trade-off it loses on today and the measurement
   that would justify revisiting it - plus the ones that have since **shipped**, kept for their
