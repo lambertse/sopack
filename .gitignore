@@ -25,12 +25,20 @@ libvosWrapperEx-arm64.so
 # Local binary/APK fixtures and third-party white-box artifacts — large, and not ours to
 # redistribute. Tests that need them skip; tests/fixtures/ below is the committed substitute.
 #
-# FOUR separate things, deliberately four directories (see CLAUDE.md "Directory layout"). Only
+# FIVE separate things, deliberately five directories (see CLAUDE.md "Directory layout"). Only
 # the first is tracked, and it is the only one that is a SOURCE:
 #   third_party/whitebox-cryptography/
 #               the pinned WBC dependency, a TRACKED git submodule. NOT ignored — it is the
-#               source vendor/wbc/ is built FROM. Its own third_party/ (libsodium, O-MVLL) is
-#               fetched by its fetch_deps.sh and ignored by its own .gitignore, not ours.
+#               source vendor/wbc/ is built FROM. Its own third_party/ (libsodium, a CPython
+#               stdlib) is fetched by its fetch_deps.sh and ignored by its own .gitignore, not
+#               ours. O-MVLL used to be in that list and is NOT any more — see below.
+#   third_party/omvll/
+#               the O-MVLL pass-plugin + its version-locked CPython 3.10 stdlib, fetched by
+#               scripts/fetch_omvll.sh. OURS now, not the submodule's: a pass-plugin only loads
+#               into the clang it was built against, so its pin moves with the NDK pin, and the
+#               NDK pin is ours (docker/Dockerfile). Fully ignored: ~65-95 MB of fetched
+#               binaries, not ours to redistribute. The hand-authored O-MVLL POLICY files are
+#               NOT here - they live in stub/ beside the sources they name.
 #   test_apks/  the local APK corpus scripts/device_test.sh runs. *.apk below already covers
 #               what is in there today, but keep the directory rule so an unpacked APK tree
 #               dropped in it does not turn `git status` into 1900 lines.
@@ -43,6 +51,9 @@ libvosWrapperEx-arm64.so
 test_apks/
 vendor/
 artifacts/
+# third_party/ itself is NOT ignored (the submodule gitlink lives there), so the omvll tree has
+# to be named explicitly or it would be tracked by default.
+third_party/omvll/
 # ...and out/, which is the same thing produced by the CONTAINER: docker/README.md bind-mounts
 # it as the bundle destination, so a docker run leaves out/bundle/ and out/sopack-bundle-*.tar.gz
 # behind. Generated, host-specific, never committed - exactly like artifacts/.

@@ -194,3 +194,37 @@ valid_wbc() {
         return 1; }
     return 0
 }
+
+# ---- SHA-256, portably --------------------------------------------------------------------
+# shasum(1) on macOS, sha256sum(1) on Linux. Both emit and accept "<hex>  <path>", so anything
+# checksummed on either host verifies on either host. This lived as a copy-pasted block in
+# artifact_generation.sh (twice) and was about to gain a third copy in fetch_omvll.sh.
+#
+# A FUNCTION rather than a $SHA256 command string: the callers that had the string were already
+# splitting it on whitespace ("shasum -a 256"), which is one unquoted expansion away from a bug.
+
+# sha256_cmd -> the command STRING, for callers that need checksum-file format
+# ("<hex>  <path>") rather than a bare hex value - i.e. generating or -c'ing a SHA256SUMS.
+sha256_cmd() {
+    if   have shasum;    then echo "shasum -a 256"
+    elif have sha256sum; then echo "sha256sum"
+    else die "neither shasum nor sha256sum on PATH"
+    fi
+}
+
+sha256_of() {   # sha256_of FILE -> lowercase hex on stdout
+    if   have shasum;    then shasum -a 256 "$1" | awk '{print $1}'
+    elif have sha256sum; then sha256sum "$1"     | awk '{print $1}'
+    else die "neither shasum nor sha256sum on PATH - cannot checksum $1"
+    fi
+}
+
+# verify_sha256 FILE EXPECTED_HEX [WHAT] - die unless they match.
+verify_sha256() {
+    local got; got="$(sha256_of "$1")"
+    [ "$got" = "$2" ] || die "SHA256 mismatch for ${3:-$1}
+       expected $2
+       got      $got
+       Refusing to use it. Delete the file and retry; if it persists, the pin is stale or the
+       download was tampered with."
+}

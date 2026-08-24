@@ -127,11 +127,13 @@ SKEL="$STUBDIR/sopk_rt_$ABI.so"
 PROV="$STUBDIR/sopk_wb_$ABI.so"
 
 # shasum(1) on macOS, sha256sum(1) on Linux. Both emit and accept "<hex>  <path>", so a bundle
-# generated on either host verifies on either host.
-if have shasum;        then SHA256="shasum -a 256"
-elif have sha256sum;   then SHA256="sha256sum"
-else die "neither shasum nor sha256sum on PATH - cannot checksum the bundle"
-fi
+# generated on either host verifies on either host. The detection lives in _common.sh so this
+# script, fetch_omvll.sh and the provenance hash above cannot disagree about which tool to use.
+#
+# NOTE the generated install.sh below keeps its OWN copy of this detection, and that is not an
+# oversight: it runs on the RECEIVING machine, where _common.sh does not exist. A bundle is
+# self-contained by design, so that one duplicate is load-bearing.
+SHA256="$(sha256_cmd)"
 
 # ---- gate 1: destination guard ---------------------------------------------------------
 # FIRST, before the host gate, because this is the data-loss check and it has to be reachable
@@ -226,6 +228,8 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
     # O-MVLL provider from a --no-omvll one. Record that rather than assuming the default held -
     # same reasoning as build_wbaes.sh's warning when it reuses a cached libwbcrypto.a.
     PROVIDER_OBFUSCATION="unknown"
+    HELPER_OBFUSCATION="unknown"
+    WBC_OBFUSCATION="unknown"
 else
     # resolve_wbc already proved this is a usable >= 3.0.0 checkout, header and all - a bare
     # `-d` here would pass on an empty (uninitialised) submodule directory.
@@ -248,6 +252,16 @@ else
         OMVLL_ARG="--omvll"
         PROVIDER_OBFUSCATION="omvll"
     fi
+    # provider-obfuscation used to be the ONLY obfuscation field, and it was read as a property
+    # of libsopk_wb.so while actually describing the vendored libwbcrypto.a - --omvll reached
+    # only WBC's build. Three fields now, because they are three separately-failable things:
+    #   provider-obfuscation  sopack's own sopk_wb.c   (libsopk_wb.so)
+    #   helper-obfuscation    sopack's own sopk_rt.c   (the thin per-target helper)
+    #   wbc-obfuscation       the vendored libwbcrypto.a
+    # build_wbaes.sh drives all three off the same --omvll flag today, so they agree; keeping
+    # them separate means a future divergence has somewhere truthful to be recorded.
+    HELPER_OBFUSCATION="$PROVIDER_OBFUSCATION"
+    WBC_OBFUSCATION="$PROVIDER_OBFUSCATION"
     BUILD_ARGS="--release $OMVLL_ARG --abi $ABI --api $API"
     [ "$FORCE" -eq 1 ] && BUILD_ARGS="$BUILD_ARGS --force"
     # shellcheck disable=SC2086
@@ -281,6 +295,44 @@ for so in "$SKEL" "$PROV"; do
     fi
 done
 ok "both skeletons are release builds (no __android_log_print)"
+
+# O-MVLL provenance. wbc-rev used to identify the obfuscator only as a side effect of WBC
+# owning the pin; sopack owns it now, so wbc-rev no longer says anything about it. Record the
+# version from the authoritative pin and the SHA256 of the plugin that is actually on this host,
+# so a shipped artifact can always be traced back to a specific plugin.
+OMVLL_VERSION_REC="n/a"
+OMVLL_SHA256_REC="n/a"
+if [ "$PROVIDER_OBFUSCATION" = "omvll" ]; then
+    OMVLL_VERSION_REC="$(grep -m1 '^OMVLL_VERSION=' "$SOPACK/scripts/fetch_omvll.sh" \
+        | cut -d'"' -f2 || true)"
+    : "${OMVLL_VERSION_REC:=unknown}"
+    if OMVLL_PLUGIN_REC="$("$SOPACK/scripts/fetch_omvll.sh" --print-plugin 2>/dev/null)"; then
+        OMVLL_SHA256_REC="$(sha256_of "$OMVLL_PLUGIN_REC")"
+    else
+        OMVLL_SHA256_REC="unknown"
+    fi
+fi
+
+# 3b. MECHANICAL obfuscation gate: verify the manifest's obfuscation claim against the ARTIFACT.
+#     A shared object records no obfuscation state, so until now "did O-MVLL run on sopack's own
+#     code?" was answered by a shell variable - and that variable said yes while the answer was
+#     no, because --omvll reached only WBC's build. This measures the file instead.
+#
+#     Method 5's own lesson, verbatim: "The build flag alone was not enough - a correct
+#     --release path already existed when the unstripped helper shipped. Nothing refused one."
+#     So: refuse one. The check itself lives in build_wbaes.sh (it has $NDKBIN resolved and it
+#     runs on every build); here we re-run it against the artifact actually being bundled,
+#     because --skip-build can hand us a provider this run never built.
+if [ "$PROVIDER_OBFUSCATION" = "omvll" ]; then
+    if OBF_OUT="$("$SOPACK/scripts/check_obfuscated.sh" "$PROV" 2>&1)"; then
+        ok "provider is demonstrably obfuscated ($OBF_OUT)"
+    else
+        die "$OBF_OUT
+
+       MANIFEST.txt is about to record provider-obfuscation: omvll for an artifact that is not.
+       To ship anyway, pass --allow-unobfuscated-provider, which records the truth."
+    fi
+fi
 
 # 4+5. wb_keygen: the one host-specific file, so both its checks are about the RECEIVING machine.
 KEYGEN_DESC="omitted (--allow-foreign-host; chacha20/xor only)"
@@ -685,6 +737,10 @@ helper-build-marker: $HELPER_MARKER
 provider-build-marker: $PROVIDER_MARKER
 provider-soname: $PROVIDER_SONAME
 provider-obfuscation: $PROVIDER_OBFUSCATION
+helper-obfuscation: $HELPER_OBFUSCATION
+wbc-obfuscation: $WBC_OBFUSCATION
+omvll-version: $OMVLL_VERSION_REC
+omvll-sha256: $OMVLL_SHA256_REC
 wb-keygen: $KEYGEN_DESC
 wb-keygen-linkage: $KEYGEN_LINKAGE
 EOF
@@ -755,6 +811,16 @@ case "$(man provider-obfuscation)" in
       obfuscated is unrecorded - a shared object carries no such state. Regenerate without
       --skip-build if this is a release bundle." ;;
 esac
+# Three obfuscation fields, because they are three separately-failable things. Older bundles
+# carry only provider-obfuscation, and `man` returns empty for a key that is not there - so an
+# old bundle stays installable and simply says nothing extra, rather than tripping a mismatch.
+case "$(man helper-obfuscation)" in
+    none)    warn "the thin per-target helper (sopk_rt) was built WITHOUT O-MVLL. Every packed
+      app then ships an identical un-obfuscated copy of the decrypt-and-place dance." ;;
+esac
+OMVLL_V="$(man omvll-version)"
+[ -n "$OMVLL_V" ] && printf '    obfuscator: O-MVLL %s (%s)\n' \
+    "$OMVLL_V" "$(man omvll-sha256 | cut -c1-12)"
 
 # 1. Host match. Only bin/wb_keygen is host-specific, so this check is only about that file:
 #    a bundle generated with --allow-foreign-host has none, and installs anywhere.

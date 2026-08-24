@@ -33,11 +33,13 @@
 #   --trace         opt into the tracing build for on-device Phase 6 verification. The result
 #                   needs `logging.allow-helper-log: true` in the pack config, and is
 #                   NOT shippable.
-#   --omvll         configure the Android build WITH the O-MVLL obfuscation plugin. This is the
-#                   DEFAULT - the provider is the artifact whose static analysis matters most.
-#                   WBC fetches and configures the plugin itself; it only loads on macOS.
-#   --no-omvll      build the Android library unobfuscated. Required on Linux (the plugin is a
-#                   Mach-O dylib), and the resulting provider is NOT what you should ship.
+#   --omvll         configure the build WITH the O-MVLL obfuscation plugin. This is the DEFAULT.
+#                   sopack owns the pin: scripts/fetch_omvll.sh vendors the plugin into
+#                   third_party/omvll/ and it is passed INTO WBC. Applies to the vendored
+#                   libwbcrypto.a AND to sopack's own skeletons (sopk_wb.c / sopk_rt.c).
+#                   Works on macOS and Linux/x86_64 - upstream publishes a plugin for each.
+#   --no-omvll      build unobfuscated. Needed on any other host, and the resulting provider
+#                   is NOT what you should ship.
 #   --skip-tests    skip Phase 2 (the unit tests)
 #   --host-only     run Phases 1-3 only and stop. Needs no NDK, no cmake and no ninja, so the
 #                   Python<->C contracts can be verified on a machine that cannot cross-compile
@@ -74,12 +76,11 @@ while [ "$#" -gt 0 ]; do
         --skip-tests) SKIP_TESTS=1; shift ;;
         --host-only)  HOST_ONLY=1; shift ;;
         --force)      FORCE=1; shift ;;
-        # 2..46 is the header comment block; it ends at the "SOPACK is this script's own
-        # repo" line, immediately before `set -euo pipefail`. Widen this if the header grows,
-        # or --help starts printing shell code.
-        # 2..47 is the header comment block, ending the line before `set -euo pipefail`.
-        # Adjust if the header grows, or --help truncates / starts printing shell code.
-        -h|--help)    sed -n '2,47p' "$0"; exit 0 ;;
+        # Self-maintaining: line 2 up to (not including) `set -euo pipefail`. This was two
+        # hardcoded ranges and two contradicting comments about them (2..46 vs 2..47), which
+        # is what a hand-maintained line number turns into. Now the header can grow freely
+        # without --help truncating or starting to print shell code.
+        -h|--help)    sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
@@ -157,11 +158,10 @@ if [ "$HOST_ONLY" -eq 0 ]; then
     [ -x "$CXX" ] || die "no clang++ at $CXX"
     [ -x "$READELF" ] || die "no llvm-readelf at $READELF"
 
-    # O-MVLL is fetched and configured by WBC's build_android.sh (it defaults OMVLL_CONFIG and
-    # OMVLL_PYTHONPATH to in-repo paths), so do NOT duplicate those checks here. What it cannot
-    # fix is a host upstream publishes no plugin for. There are two: macOS (Mach-O dylib) and
-    # Linux/x86_64 (ELF .so), and WBC picks between them itself - so this gate is now only about
-    # refusing the hosts that have neither.
+    # sopack fetches and supplies the plugin (scripts/fetch_omvll.sh) and picks the per-host
+    # filename itself; WBC only consumes what it is handed. This gate is about the hosts
+    # upstream publishes no plugin for at all: macOS (Mach-O dylib) and Linux/x86_64 (ELF .so)
+    # are the only two. fetch_omvll.sh repeats the check because it can be run directly.
     if [ "$OMVLL" -eq 1 ]; then
         case "$(uname -s)/$(uname -m)" in
             Darwin/*)      ;;
@@ -442,6 +442,26 @@ EOF
     exit 0
 fi
 
+# The O-MVLL pin now lives in TWO places: scripts/fetch_omvll.sh (authoritative) and the WBC
+# submodule's third_party/fetch_deps.sh (its standalone-dev fallback). That duplication is the
+# price of keeping WBC buildable on its own, and it re-creates one layer up exactly the drift
+# that omvll_plugin_path()'s "the fetcher and the consumer cannot drift" comment guards against.
+# A warning is the only thing that turns a silent skew into a visible one. Not fatal: WBC's
+# fallback is not used on this path, so a lagging pin there is untidy, not wrong.
+check_omvll_pin_drift() {
+    local ours theirs wbc_fetch="$WBC/third_party/fetch_deps.sh"
+    [ -f "$wbc_fetch" ] || return 0
+    ours="$(grep -m1 '^OMVLL_LINUX_SHA256=' "$SOPACK/scripts/fetch_omvll.sh" | cut -d'"' -f2)"
+    theirs="$(grep -m1 '^OMVLL_LINUX_SHA256=' "$wbc_fetch" | cut -d'"' -f2)"
+    [ -n "$ours" ] && [ -n "$theirs" ] || return 0
+    [ "$ours" = "$theirs" ] && return 0
+    warn "the O-MVLL pin has drifted between the two repos:
+      sopack scripts/fetch_omvll.sh   $ours
+      WBC    third_party/fetch_deps.sh $theirs
+      sopack's is authoritative and is what this build uses; WBC's is only its standalone
+      fallback. Reconcile them when you next touch the submodule."
+}
+
 step 4 "$TOTAL" "Phase 4 - Android libwbcrypto.a + helper skeleton"
 ANDROID_LIB="$WBC/build-android/libwbcrypto.a"
 if [ -f "$ANDROID_LIB" ] && [ "$FORCE" -eq 0 ]; then
@@ -451,20 +471,32 @@ if [ -f "$ANDROID_LIB" ] && [ "$FORCE" -eq 0 ]; then
     [ "$OMVLL" -eq 1 ] && warn "the cached archive may predate --omvll becoming the default; an
       .a records no obfuscation state, so re-run with --force if this is a release build"
 else
-    # build_android.sh defaults to O-MVLL ON and fetches/configures the plugin itself, so the
-    # obfuscated build is "pass nothing". Preflight already refused --omvll on a non-Darwin host.
+    # sopack OWNS the O-MVLL pin now (scripts/fetch_omvll.sh) and passes the plugin into WBC,
+    # rather than letting the submodule fetch its own. A pass-plugin only loads into the clang
+    # it was built against, so the O-MVLL pin moves with the NDK pin - and the NDK pin is ours.
+    # WBC keeps a fetch of its own purely as a standalone-dev fallback.
     OMVLL_ARG=""
-    [ "$OMVLL" -eq 0 ] && OMVLL_ARG="--no-omvll"
+    if [ "$OMVLL" -eq 0 ]; then
+        OMVLL_ARG="--no-omvll"
+    else
+        # Gated on OMVLL=1: --no-omvll must not pull ~65-95 MB it will never use.
+        "$SOPACK/scripts/fetch_omvll.sh" || die "scripts/fetch_omvll.sh failed"
+        OMVLL_PLUGIN="$("$SOPACK/scripts/fetch_omvll.sh" --print-plugin)" \
+            || die "fetch_omvll.sh reported no plugin after a successful fetch"
+        OMVLL_PYLIB="$("$SOPACK/scripts/fetch_omvll.sh" --print-pythonpath)" \
+            || die "fetch_omvll.sh reported no CPython stdlib after a successful fetch"
+        OMVLL_ARG="--omvll-plugin $OMVLL_PLUGIN --omvll-pythonpath $OMVLL_PYLIB"
+        check_omvll_pin_drift
+    fi
 
     # Can clang actually LOAD the plugin? Ask the dynamic linker before handing 155 translation
     # units to ninja. clang reports an unloadable plugin per-TU, so the real failure - one line
     # about a missing symbol or glibc version - arrives buried in ten identical multi-line
     # walls. The known instance: the O-MVLL 1.9.1 Linux plugin requires GLIBC_2.38, so it will
     # not load on Debian bookworm (2.36); the shipped image uses ubuntu:24.04 for that reason.
-    # Only checkable when the plugin is already vendored - build_android.sh fetches it otherwise,
-    # and skipping the check then is fine because a fresh fetch is not the interesting case.
-    OMVLL_PLUGIN="$WBC/third_party/omvll/omvll_ndk_r29.so"
-    if [ "$OMVLL" -eq 1 ] && [ "$(uname -s)" = "Linux" ] && [ -f "$OMVLL_PLUGIN" ] && have ldd; then
+    # This used to be skippable (the plugin might not be vendored yet); now we always fetch
+    # first, so it always runs.
+    if [ "$OMVLL" -eq 1 ] && [ "$(uname -s)" = "Linux" ] && have ldd; then
         LDD_OUT="$(ldd "$OMVLL_PLUGIN" 2>&1 || true)"
         case "$LDD_OUT" in
             *"not found"*)
@@ -480,8 +512,14 @@ else
     fi
 
     info "cross-building the runtime library (${OMVLL_ARG:---omvll}) …"
+    # OMVLL_CONFIG is deliberately NOT exported. WBC's build_android.sh only defaults it when
+    # empty, so an exported value from this script would win - and sopack's config names
+    # sopk_wb.c/sopk_rt.c, which match nothing in vm.cpp/trusted_storage.cpp. The result would
+    # be a clean, successful build producing an UNOBFUSCATED libwbcrypto.a with no error
+    # anywhere. Let WBC pick its own policy; we only supply the tool.
     # shellcheck disable=SC2086
-    ( cd "$WBC" && NDK="$NDK" ./scripts/build_android.sh --abi "$ABI" --api "$API" $OMVLL_ARG ) \
+    ( cd "$WBC" && env -u OMVLL_CONFIG NDK="$NDK" \
+        ./scripts/build_android.sh --abi "$ABI" --api "$API" $OMVLL_ARG ) \
         || die "scripts/build_android.sh failed"
 fi
 [ -f "$ANDROID_LIB" ] || die "expected $ANDROID_LIB after build_android.sh"
@@ -539,9 +577,49 @@ TRACE_FLAGS=""
 # version. The packer strips what it can at pack time, but doing it here keeps the artifact
 # honest. Note -ffile-prefix-map only rewrites paths for THESE files; strings baked into
 # libwbcrypto.a need the same flag in the whitebox-cryptography build.
+# ---- O-MVLL for sopack's OWN code ---------------------------------------------------------
+# This used to be missing entirely: --omvll reached only WBC's build_android.sh, so the
+# vendored libwbcrypto.a was obfuscated while sopack's own sopk_wb.c and sopk_rt.c - the region
+# scan, the passphrase de-whitening, the wbc_* call sequence, the whole decrypt-and-place dance
+# - shipped as plain -O2 clang output. MANIFEST.txt recorded `provider-obfuscation: omvll` the
+# whole time, and install.sh presented that as a property of libsopk_wb.so. A control that
+# reports itself present when it is absent is worse than a known gap: it stops anyone looking.
+#
+# WBAES.md Phase 4 already told a MANUAL builder to add plugin flags to these two lines and
+# warned that leaving the thin helper unobfuscated is "a hardening regression versus the pre-v3
+# single artifact". The automated path - the one BUILDING.md presents as the default - simply
+# did not implement that warning.
+#
+# The config is sopack's own (stub/omvll_config_wb.py) and is passed PER-INVOCATION via env,
+# never exported: WBC only defaults OMVLL_CONFIG when empty, so an exported value would leak
+# into the sub-build and silently unobfuscate libwbcrypto.a.
+SOPK_OMVLL_CFLAGS=()
+SOPK_OMVLL_ENV=()
+if [ "$OMVLL" -eq 1 ]; then
+    if [ -z "${OMVLL_PLUGIN:-}" ]; then
+        OMVLL_PLUGIN="$("$SOPACK/scripts/fetch_omvll.sh" --print-plugin)" \
+            || die "no O-MVLL plugin vendored; run scripts/fetch_omvll.sh"
+        OMVLL_PYLIB="$("$SOPACK/scripts/fetch_omvll.sh" --print-pythonpath)" \
+            || die "no O-MVLL CPython stdlib vendored; run scripts/fetch_omvll.sh"
+    fi
+    SOPK_OMVLL_CFG="$SOPACK/stub/omvll_config_wb.py"
+    [ -f "$SOPK_OMVLL_CFG" ] || die "missing $SOPK_OMVLL_CFG - without a config the plugin
+       loads but applies NO passes, i.e. an unobfuscated build that looks obfuscated."
+    # -Wl,-z,muldefs mirrors what WBC's CMakeLists adds: O-MVLL's function cloning can emit
+    # duplicate EH helper symbols. It is part of the contract, not an optional extra.
+    SOPK_OMVLL_CFLAGS=(-fpass-plugin="$OMVLL_PLUGIN" -Wl,-z,muldefs)
+    SOPK_OMVLL_ENV=(env "OMVLL_CONFIG=$SOPK_OMVLL_CFG" "OMVLL_PYTHONPATH=$OMVLL_PYLIB")
+    info "O-MVLL will be applied to sopack's own skeletons (config: $(basename "$SOPK_OMVLL_CFG"))"
+else
+    warn "--no-omvll: sopack's own sopk_wb.c / sopk_rt.c will ship UNOBFUSCATED. The provider
+      carries the sealed blob and every wbc_* call; this is the artifact whose static analysis
+      matters most."
+fi
+
 link_provider() {   # link_provider <extra flags…>
     # shellcheck disable=SC2086
-    "$CXX" --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 -g0 \
+    "${SOPK_OMVLL_ENV[@]}" "$CXX" --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 -g0 \
+        "${SOPK_OMVLL_CFLAGS[@]}" \
         -ffile-prefix-map="$WBC=." -ffile-prefix-map="$SOPACK=." \
         -fvisibility=hidden -Wl,--exclude-libs,ALL -Wl,--no-undefined \
         -Wl,-soname,"$PROV_SONAME" \
@@ -581,7 +659,8 @@ ok "provider: $(basename "$PROV") ($(wc -c <"$PROV" | tr -d ' ') bytes)"
 # the DT_NEEDED comes from the provider's DT_SONAME rather than being invented.
 link_skeleton() {   # link_skeleton <extra flags…>
     # shellcheck disable=SC2086
-    "$NDKBIN/clang" --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 -g0 \
+    "${SOPK_OMVLL_ENV[@]}" "$NDKBIN/clang" --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 -g0 \
+        "${SOPK_OMVLL_CFLAGS[@]}" \
         -ffile-prefix-map="$SOPACK=." \
         -fvisibility=hidden -Wl,--no-undefined \
         "$@" \
@@ -674,6 +753,24 @@ if [ -n "$PROV_IMPORTS" ]; then
        targets) would fail to load with it."
 fi
 ok "provider imports no wbc_*/sodium_* (so it will load)"
+
+# Did O-MVLL actually run on OUR code? A .so records no obfuscation state, so this was
+# previously answered by a shell variable - and that variable said "omvll" for a year while
+# --omvll reached only WBC's sub-build and sopack's own sopk_wb.c shipped as plain -O2 output.
+# Measure the artifact. Exit 2 means "could not tell", which is NOT a pass and NOT a failure.
+if [ "$OMVLL" -eq 1 ]; then
+    # rc captured explicitly: `$?` read inside an elif is one refactor away from reporting the
+    # status of the test before it, and the difference here is "unobfuscated" vs "cannot tell".
+    OBF_RC=0
+    OBF_OUT="$(NDK="$NDK" "$SOPACK/scripts/check_obfuscated.sh" "$PROV" 2>&1)" || OBF_RC=$?
+    case "$OBF_RC" in
+        0) ok "O-MVLL demonstrably ran on sopack's own code ($OBF_OUT)" ;;
+        2) warn "could not verify mechanically whether O-MVLL ran on sopack's own code:
+      $OBF_OUT" ;;
+        *) die "$OBF_OUT" ;;
+    esac
+fi
+
 
 info "checking the thin helper …"
 BAD_NEEDED=""
