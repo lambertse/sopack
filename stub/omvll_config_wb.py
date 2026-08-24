@@ -114,7 +114,25 @@ if _seed:
 
 
 class SopackWbConfig(omvll.ObfuscationConfig):
-    def flatten_functions(self, mod, func):
+    """Only methods O-MVLL ACTUALLY calls.
+
+    The names are not free-form: ObfuscationConfig dispatches by exact method name, and a name
+    the base class does not know is simply never called - no error, no warning, no passes. This
+    config previously defined flatten_functions, obfuscate_constants, obfuscate_struct_access
+    and anti_hooking. None of those exist in O-MVLL 1.6.0 or 1.9.1, so the single biggest
+    transform (control-flow flattening, whose real name is `flatten_cfg`) silently never ran.
+
+    Measured, same source, same plugin, one name changed:
+        plain                             613 .text instructions
+        with flatten_functions (no-op)   1247
+        with flatten_cfg                 2223
+
+    The API, per the plugin's own sample config and identical in 1.6.0 and 1.9.1:
+        obfuscate_arithmetic, flatten_cfg, obfuscate_string, indirect_call,
+        break_control_flow, function_outline, basic_block_duplicate
+    """
+
+    def flatten_cfg(self, mod, func):
         return _in_scope(mod, func)
 
     def break_control_flow(self, mod, func):
@@ -123,24 +141,20 @@ class SopackWbConfig(omvll.ObfuscationConfig):
     def obfuscate_arithmetic(self, mod, func):
         return _in_scope(mod, func)
 
-    def obfuscate_constants(self, mod, func):
-        # The region-layout constants (48, 32, 1024, version 3) are the clearest tell in a
-        # disassembly of sopk_wb_k - they name the protocol outright.
-        return _in_scope(mod, func)
-
-    def obfuscate_struct_access(self, mod, func, struct):
-        return _in_scope(mod, func)
-
     def obfuscate_string(self, mod, func, string):
-        # Release skeletons carry no log strings, but the magic bytes and build markers are
+        # Release skeletons carry no log strings, but the region magics and build markers are
         # rodata this can reach. Harmless when there is nothing to encode.
         return _in_scope(mod, func)
 
-    def anti_hooking(self, mod, func):
-        # Permanently off: it conflicts with control-flow flattening ("Cannot inject a
-        # hooking prologue ... since there is one") on the cloned functions CFF produces.
-        # Observed on NDK r29 / O-MVLL 1.9.1, same as WBC hit.
-        return False
+    # NOT enabled, and each for a reason rather than by omission:
+    #
+    #   basic_block_duplicate  emits a call to libc lrand48. Fine here (the skeletons link libc,
+    #                          unlike the freestanding stub) but untested, and it multiplies code
+    #                          size on artifacts that already ship once per protected library.
+    #   indirect_call          the scoped functions' only external call is sopk_wb_k, which must
+    #                          stay a resolvable PLT call into the provider.
+    #   function_outline       O-MVLL already outlines as part of flattening; forcing more of it
+    #                          on a 5-function artifact buys little.
 
 
 @lru_cache(maxsize=1)

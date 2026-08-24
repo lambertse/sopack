@@ -740,6 +740,12 @@ ok "skeleton built: $SKEL"
 # .dynstr / the section header table - which is what bionic needs. This is NOT the section-header
 # stripping that docs/technical/HARDENING.md §Method 3 rejected (that zeroed e_shoff).
 STRIP="$(dirname "$CXX")/llvm-strip"
+# Keep an unstripped copy for the obfuscation gate below. O-MVLL's outlined siblings
+# (sopk_rt_ctor.1, ...) are LOCAL symbols, so --strip-all deletes the only evidence that the
+# obfuscation ran - and stripping is exactly what we want to keep doing to the shipped file.
+# The copy lives in $TMP and dies with it.
+SKEL_UNSTRIPPED="$TMP/$(basename "$SKEL").unstripped"
+cp "$SKEL" "$SKEL_UNSTRIPPED"
 if [ -x "$STRIP" ]; then
     before=$(wc -c <"$SKEL")
     "$STRIP" --strip-all "$SKEL" || die "llvm-strip failed on $SKEL"
@@ -801,34 +807,23 @@ if [ -n "$PROV_IMPORTS" ]; then
 fi
 ok "provider imports no wbc_*/sodium_* (so it will load)"
 
-# Obfuscation gate for the THIN HELPER. Unlike the provider this works on the stripped
-# artifact: the helper links no white-box at all, so its .text is 100% sopack's own code and
-# whole-.text instruction count is a direct measurement rather than a proxy.
+# Obfuscation gate for the THIN HELPER, using the same structural signal as the provider:
+# did O-MVLL outline sopk_rt_ctor into siblings? That is binary and version-independent. An
+# earlier version counted .text instructions against a floor, which cannot work - the same
+# source measured 613 / 1247 / 2223 depending on plugin version and one config method name, so
+# any single threshold mis-gates some toolchain.
+#
 # rc captured explicitly - `$?` read inside an elif is one refactor away from reporting the
 # status of the test before it, and the difference here is "unobfuscated" vs "cannot tell".
 if [ "$OMVLL" -eq 1 ]; then
     OBF_RC=0
-    OBF_OUT="$(NDK="$NDK" "$SOPACK/scripts/check_obfuscated.sh" --mode text "$SKEL" 2>&1)" \
-        || OBF_RC=$?
-    # WARN, not die, and the asymmetry with the provider check above is deliberate.
-    #
-    # The provider gate (--mode symbol) is calibrated against both sides with a wide margin:
-    # 256 bytes plain vs 1820 obfuscated, floor 600. The helper gate (--mode text) has a much
-    # narrower one - 613 plain vs 1537 obfuscated, floor 1000 - because most of the helper's
-    # .text is libc glue the config correctly leaves alone, so obfuscation only moves the total
-    # 2.5x. Those numbers were measured with O-MVLL 1.6.0; the shipping pin is 1.9.1, and a
-    # different pass set could land lower.
-    #
-    # A threshold that blocks every build on a pass-set change is worse than one that reports.
-    # artifact_generation.sh keeps this FATAL, because that is where the claim gets written into
-    # MANIFEST.txt and shipped - the failure that actually matters.
+    OBF_OUT="$(NDK="$NDK" "$SOPACK/scripts/check_obfuscated.sh" \
+        --mode symbol --symbol sopk_rt_ctor "$SKEL_UNSTRIPPED" 2>&1)" || OBF_RC=$?
     case "$OBF_RC" in
         0) ok "thin helper: O-MVLL demonstrably ran ($OBF_OUT)" ;;
         2) warn "thin helper: could not verify whether O-MVLL ran:
       $OBF_OUT" ;;
-        *) warn "thin helper does not look obfuscated:
-      $OBF_OUT
-      Not fatal here - artifact_generation.sh refuses it when building a bundle." ;;
+        *) die "$OBF_OUT" ;;
     esac
 fi
 

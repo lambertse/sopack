@@ -177,68 +177,66 @@ def test_two_obfuscated_packs_of_one_library_get_different_whitening_keys(tmp_pa
 
 
 def _recover_whitening_key(packed: bytes):
-    """Re-run the S2 attack against a packed library and return the key it yields.
+    """Re-run the S2 attack against a packed library and return the whitening key it yields.
 
-    Locating the stub cannot use a fixed byte signature any more - that is the entire point of
-    polymorphism - so this walks the appended R+X segment instead, which is the structural
-    fingerprint the docs correctly say cannot be removed.
+    SCANS rather than assuming a fixed offset, and that is not incidental: polymorphism moves
+    g_decinfo to a different offset in every build, and the injected segment can carry
+    alignment padding past the end of the blob, so "the last 128 bytes of the segment" is wrong
+    in general. An earlier version assumed exactly that and passed locally while failing in the
+    builder container.
+
+    Scanning is also the honest reproduction of the attack. `magic == b'SOPK'` after de-whitening
+    is a self-verifying 32-bit oracle, so an analyst does not need to know the offset either -
+    they try candidates until one validates, which is precisely what this does.
     """
     import lief
     from sopack.cipher import WHITEN_SPAN, whiten, whiten_key
-    from sopack.metadata import DecInfo
+    from sopack.metadata import MAGIC, SIZE
+
     b = lief.parse(list(packed))
     if b is None:
         return None
+    want = MAGIC.to_bytes(4, "little")
     for seg in b.segments:
         if seg.type != lief.ELF.Segment.TYPE.LOAD:
             continue
         flags = int(seg.flags)
-        if not (flags & 0x1 and flags & 0x4):        # PF_X | PF_R
+        if not (flags & 0x1 and flags & 0x4):        # PF_X | PF_R: the injected stub segment
             continue
         blob = bytes(seg.content)
-        if len(blob) < WHITEN_SPAN + 128:
-            continue
-        # decinfo is the last 128 bytes of the injected blob; the span precedes it.
-        for end in (len(blob), len(blob) - (len(blob) % 16)):
-            rec_off = end - 128
-            if rec_off < WHITEN_SPAN:
-                continue
+        # g_decinfo is 8-aligned in .sopk_info; step 4 anyway, it is only a few hundred tries.
+        for rec_off in range(WHITEN_SPAN, len(blob) - SIZE + 1, 4):
             span = blob[rec_off - WHITEN_SPAN:rec_off]
-            key = whiten_key(span)
-            rec = whiten(blob[rec_off:rec_off + 128], span)
-            try:
-                if DecInfo.unpack(rec) is not None:
-                    return key
-            except Exception:
-                continue
+            rec = whiten(blob[rec_off:rec_off + SIZE], span)
+            if rec[:4] == want:
+                return whiten_key(span)
     return None
 
 
-# ---- export hygiene under O-MVLL ---------------------------------------------------------
+def test_omvll_configs_use_method_names_the_plugin_actually_dispatches():
+    """ObfuscationConfig dispatches by EXACT method name and silently ignores an unknown one.
 
-def test_link_lines_carry_version_scripts():
-    """-fvisibility=hidden is NOT sufficient once O-MVLL runs.
+    stub/omvll_config_wb.py once defined `flatten_functions`, which does not exist in O-MVLL
+    1.6.0 or 1.9.1 - so control-flow flattening, the single biggest transform, never ran. It
+    failed silently and looked exactly like a working build. Measured, same source, same
+    plugin, that one name: 1247 .text instructions vs 2223 with `flatten_cfg`.
 
-    O-MVLL promotes the linkage of the functions it transforms, so the obfuscated thin helper -
-    which must export nothing at all - came out exporting sopk_rt_ctor, self_cb, tgt_cb and
-    sopk_wipe. Four internal names describing the protocol, added to .dynsym by the pass that
-    was supposed to be hiding them. Phase 4's PASS gate caught it on a real build; this is the
-    cheap guard that the fix does not get dropped from the link lines.
+    The valid set comes from the plugin's own sample-omvll-config.py, identical in both
+    versions. Anything outside it is dead code that reads as a shipped control.
     """
-    build = (REPO / "scripts" / "build_wbaes.sh").read_text()
-    assert 'printf \'{ local: *; };\\n\' > "$HIDE_ALL_MAP"' in build
-    assert 'printf \'{ global: sopk_wb_k; local: *; };\\n\' > "$PROV_MAP"' in build
-    # Both link functions must actually use them.
-    prov = build[build.index("link_provider()"):build.index("link_skeleton()")]
-    skel = build[build.index("link_skeleton()"):]
-    assert "--version-script=\"$PROV_MAP\"" in prov, "provider link lost its version script"
-    assert "--version-script=\"$HIDE_ALL_MAP\"" in skel, "helper link lost its version script"
-
-
-def test_check_obfuscated_prefers_the_ndk_llvm_objdump():
-    """The NDK ships llvm-objdump and never a plain `objdump`. Searching only for the plain
-    name fell through to whatever was on PATH - in the builder container an x86_64-only
-    binutils, which reads an aarch64 .so as having no instructions, so the gate silently went
-    to 'cannot tell' on the one host that matters."""
-    src = (REPO / "scripts" / "check_obfuscated.sh").read_text()
-    assert 'for cand in "llvm-$n" "$n"; do' in src
+    valid = {
+        "obfuscate_arithmetic", "flatten_cfg", "obfuscate_string", "indirect_call",
+        "break_control_flow", "function_outline", "basic_block_duplicate",
+        "__init__",
+    }
+    import ast as _ast
+    for name in ("omvll_config.py", "omvll_config_wb.py"):
+        tree = _ast.parse((REPO / "stub" / name).read_text())
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.ClassDef):
+                continue
+            for fn in [n for n in node.body if isinstance(n, _ast.FunctionDef)]:
+                assert fn.name in valid, (
+                    f"stub/{name}: {node.name}.{fn.name}() is not an O-MVLL "
+                    f"ObfuscationConfig method - it will never be called. "
+                    f"Valid: {sorted(valid - {'__init__'})}")

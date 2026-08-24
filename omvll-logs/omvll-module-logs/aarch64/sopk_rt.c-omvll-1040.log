@@ -65,3 +65,70 @@
 [omvll::IndirectBranch] Changes not applied on module /workspace/stub/sopk_rt.c
 [omvll::Cleaning] Executing on module /workspace/stub/sopk_rt.c
 [omvll::Cleaning] Changes  applied on module /workspace/stub/sopk_rt.c
+[omvll::AntiHook] Executing on module /workspace/stub/sopk_rt.c
+[omvll::AntiHook] Changes not applied on module /workspace/stub/sopk_rt.c
+[omvll::FunctionOutline] Executing on module /workspace/stub/sopk_rt.c
+[omvll::StringEncoding] Executing on module /workspace/stub/sopk_rt.c
+[omvll::StringEncoding] Changes not applied on module /workspace/stub/sopk_rt.c
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.self_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.sopk_rt_region
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.sopk_rt_region
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.sopk_rt_region
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.self_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.tgt_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.tgt_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.tgt_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.dl_phdr_info
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.dl_phdr_info
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Load   %22 = load i32, ptr %21, align 8, !tbaa !20 expects 2 indices for the structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.dl_phdr_info
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Load   %69 = load i32, ptr %68, align 8, !tbaa !20 expects 2 indices for the structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.elf64_phdr
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.sopk_rt_region
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.self_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.self_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.dl_phdr_info
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.tgt_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.tgt_scan
+[omvll::OpaqueFieldAccess] Executing on module /workspace/stub/sopk_rt.c over structure struct.tgt_scan
+[omvll::OpaqueFieldAccess] Changes  applied on module /workspace/stub/sopk_rt.c
+[omvll::BasicBlockDuplicate] Executing on module /workspace/stub/sopk_rt.c
+[omvll::BasicBlockDuplicate] Changes not applied on module /workspace/stub/sopk_rt.c
+[omvll::ControlFlowFlattening] Executing on module /workspace/stub/sopk_rt.c
+[omvll::ControlFlowFlattening] Changes not applied on module /workspace/stub/sopk_rt.c
+[omvll::BreakControlFlow] Executing on module /workspace/stub/sopk_rt.c
+[omvll::BreakControlFlow] Visiting function sopk_rt_ctor
+[omvll::BreakControlFlow] Visiting function self_cb
+[omvll::BreakControlFlow] Visiting function tgt_cb
+[omvll::BreakControlFlow] Visiting function sopk_wipe
+[omvll::BreakControlFlow] Total of 4 functions were modified on module /workspace/stub/sopk_rt.c
+[omvll::BreakControlFlow] Changes  applied on module /workspace/stub/sopk_rt.c
+[omvll::OpaqueConstants] Executing on module /workspace/stub/sopk_rt.c
+[omvll::OpaqueConstants] Changes  applied on module /workspace/stub/sopk_rt.c
+[omvll::Arithmetic] Executing on module /workspace/stub/sopk_rt.c
+[omvll::Arithmetic] Visiting function sopk_rt_ctor
+[omvll::Arithmetic][sopk_rt_ctor] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic][sopk_rt_ctor] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic] Visiting function self_cb
+[omvll::Arithmetic][self_cb] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic][self_cb] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic] Visiting function tgt_cb
+[omvll::Arithmetic][tgt_cb] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic][tgt_cb] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic] Visiting function sopk_wb_k
+[omvll::Arithmetic] Visiting function sopk_wipe
+[omvll::Arithmetic][sopk_wipe] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic][sopk_wipe] Metadata (2) overrides rounds (3) for add
+[omvll::Arithmetic] Changes not applied on module /workspace/stub/sopk_rt.c
+[omvll::IndirectCall] Executing on module /workspace/stub/sopk_rt.c
+[omvll::IndirectCall] Changes not applied on module /workspace/stub/sopk_rt.c
+[omvll::IndirectBranch] Executing on module /workspace/stub/sopk_rt.c
+[omvll::IndirectBranch] Changes not applied on module /workspace/stub/sopk_rt.c
+[omvll::Cleaning] Executing on module /workspace/stub/sopk_rt.c
+[omvll::Cleaning] Changes  applied on module /workspace/stub/sopk_rt.c

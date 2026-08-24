@@ -94,9 +94,25 @@ find_tool() {   # find_tool NAME -> path, preferring the NDK's copy
     command -v "$n" 2>/dev/null && return 0
     return 1
 }
+# $NDK is REQUIRED, and this is a hard error rather than a fallback. The tools that can read an
+# Android .so are the NDK's; a host binutils is either absent or - on an x86_64 builder reading
+# an aarch64 artifact - silently returns an empty disassembly, which this script then has to
+# report as "cannot tell". A gate that degrades to "cannot tell" whenever an environment
+# variable is unset is not a gate, and the whole point of this script is that the obfuscation
+# claim must be checkable. Fail loudly and name the fix.
+if [ -z "${NDK:-}${ANDROID_NDK_HOME:-}${ANDROID_NDK_ROOT:-}" ]; then
+    echo "ERROR: \$NDK is not set (nor ANDROID_NDK_HOME / ANDROID_NDK_ROOT).
+       This check needs the NDK's llvm-readelf and llvm-objdump: they are the tools that can
+       read an aarch64 .so. A host objdump is usually x86_64-only and disassembles an Android
+       library to nothing, which would make this report 'cannot tell' instead of measuring.
+       Set NDK=/path/to/android-ndk-r29 and re-run." >&2
+    exit 2
+fi
+
 READELF="$(find_tool readelf || true)"
-[ -n "$READELF" ] || { echo "cannot verify obfuscation: no readelf available. That is 'unknown',
-       NOT 'obfuscated' - do not record a claim you could not check." >&2; exit 2; }
+[ -n "$READELF" ] || { echo "cannot verify obfuscation: no readelf found, even with \$NDK set.
+       Is \$NDK really an NDK root? Expected
+       \$NDK/toolchains/llvm/prebuilt/<host>/bin/llvm-readelf." >&2; exit 2; }
 
 if [ "$MODE" = "text" ]; then
     : "${MIN:=1000}"   # between the measured 613 (plain) and 1537 (obfuscated)
@@ -124,24 +140,48 @@ if [ "$MODE" = "text" ]; then
     exit 0
 fi
 
-# --- mode symbol: sum SYMBOL and its O-MVLL outlined siblings, from .symtab, PRE-STRIP -------
-: "${MIN:=600}"   # plain sopk_wb_k is 544 bytes; obfuscation took a 128-byte function to 1764
+# --- mode symbol: outlining siblings in .symtab, PRE-STRIP ---------------------------------
+#
+# The signal is STRUCTURAL, not a size threshold, and that is deliberate. O-MVLL splits every
+# function it transforms into `name` plus `name.1`, `name.2`, ... Measured on the thin helper:
+#
+#     plain        sopk_rt_ctor self_cb tgt_cb sopk_wipe                     (4 symbols, no .N)
+#     obfuscated   ...plus sopk_rt_ctor.1 self_cb.2 tgt_cb.3 sopk_wipe.4     (8 symbols)
+#
+# Presence of a `.N` sibling is binary and holds across plugin versions, whereas code growth
+# emphatically does not: the same source measured 613 / 1247 / 2223 instructions depending on
+# O-MVLL version and one method name. A threshold calibrated on one toolchain silently
+# mis-gates another, which is how this check first shipped wrong. Bytes are still reported,
+# for context; the sibling is what decides. --min is accepted but unused in this mode.
+: "${MIN:=0}"
 if [ "$("$READELF" -SW "$TARGET" 2>/dev/null | grep -c '\.symtab')" -eq 0 ]; then
     echo "$(basename "$TARGET") has no .symtab - it is already stripped, and O-MVLL's outlined
-       siblings ($SYMBOL.1, ...) are LOCAL symbols that the strip removed. This check must run
+       siblings ($SYMBOL.1, ...) are LOCAL symbols the strip removed. This check must run
        BEFORE llvm-strip. Cannot tell from this artifact." >&2
     exit 2
 fi
-TOTAL="$("$READELF" -sW "$TARGET" 2>/dev/null \
-    | awk -v s="$SYMBOL" '$4=="FUNC" && ($8==s || index($8, s ".")==1) { n+=$3 } END{print n+0}')"
-if [ "$TOTAL" -eq 0 ]; then
+SYMS="$("$READELF" -sW "$TARGET" 2>/dev/null \
+    | awk -v s="$SYMBOL" '$4=="FUNC" && ($8==s || index($8, s ".")==1) { print $8, $3 }')"
+if [ -z "$SYMS" ]; then
     echo "no FUNC symbol '$SYMBOL' (or '$SYMBOL.*') in $(basename "$TARGET") (unknown)." >&2
     exit 2
 fi
-if [ "$TOTAL" -lt "$MIN" ]; then
-    echo "$SYMBOL family in $(basename "$TARGET") totals $TOTAL bytes (floor $MIN) - UNOBFUSCATED.
-       O-MVLL did not run on sopack's own code. A plain sopk_wb_k is 544 bytes and obfuscation
-       both grows it and splits it into $SYMBOL.1 etc; neither happened here." >&2
+NSYM="$(printf '%s\n' "$SYMS" | wc -l | tr -d ' ')"
+TOTAL="$(printf '%s\n' "$SYMS" | awk '{n+=$2} END{print n+0}')"
+OUTLINED="$(printf '%s\n' "$SYMS" | awk -v s="$SYMBOL" '$1 != s' | wc -l | tr -d ' ')"
+
+# Outlining alone decides. A byte floor cannot: a plain sopk_rt_ctor is 1704 bytes and a plain
+# sopk_wb_k is 544, so any single threshold either passes the unobfuscated helper or fails the
+# obfuscated provider. The sibling count needs no per-symbol calibration at all.
+if [ "$OUTLINED" -eq 0 ]; then
+    echo "$SYMBOL in $(basename "$TARGET") is a single $TOTAL-byte function with no outlined
+       siblings - UNOBFUSCATED. O-MVLL splits what it transforms into $SYMBOL.1, $SYMBOL.2, ...
+       and none are present.
+       Check that a plugin is vendored (scripts/fetch_omvll.sh), that the config exists, and
+       that the plugin actually LOADED - clang reports an unloadable pass-plugin once per
+       translation unit, so the real error hides in the wall of output.
+       Check the config's METHOD NAMES too: ObfuscationConfig dispatches by exact name and
+       silently ignores one it does not know (the real name for flattening is flatten_cfg)." >&2
     exit 1
 fi
-echo "$SYMBOL family in $(basename "$TARGET"): $TOTAL bytes across $("$READELF" -sW "$TARGET" 2>/dev/null | awk -v s="$SYMBOL" '$4=="FUNC" && ($8==s || index($8, s ".")==1)' | wc -l | tr -d ' ') symbol(s) (floor $MIN)"
+echo "$SYMBOL family in $(basename "$TARGET"): $NSYM symbol(s), $OUTLINED outlined, $TOTAL bytes"

@@ -32,6 +32,22 @@ packages = ["sopack"]
 sopack = ["stubs/*.bin", "stubs/*.json"]
 
 [tool.pytest.ini_options]
+# testpaths is NOT optional here, and it is the reason this section is dangerous to add without
+# it. Declaring any [tool.pytest.ini_options] makes pyproject.toml the configfile, which sets
+# rootdir to the repo root - and a bare `pytest` then walks the whole tree. Two vendored CPython
+# stdlibs live under third_party/ (the O-MVLL plugin embeds a 3.10 interpreter and needs its
+# Lib/), carrying ~1400 files named test_*.py between them. Collecting them is not merely slow:
+# idlelib/idle_test/test_configdialog.py imports tkinter at module scope and ABORTS the
+# interpreter, so `pytest` died before running a single one of ours.
+testpaths = ["tests"]
+
+# Belt and braces: testpaths only bounds the default run, so an explicit `pytest third_party/...`
+# or a plugin that rescans would still walk in.
+norecursedirs = [
+    "third_party", "vendor", "artifacts", "out", "output", "build", "test_apks",
+    ".git", "*.egg-info",
+]
+
 # `slow` marks the tests that shell out to clang+lld through O-MVLL. They skip themselves when
 # the toolchain is absent, so this is a label for `-m "not slow"`, not a gate.
 markers = ["slow: needs the NDK + O-MVLL toolchain and takes seconds, not milliseconds"]
