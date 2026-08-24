@@ -5,8 +5,26 @@
  * (that is how all app logging works), so this produces a normal logcat line
  * under untrusted_app.
  *
- * Enabled per-injection via SOPK_FLAG_LOG in decinfo.flags (CLI: --log). When
- * off, the code is compiled in but never called, so it is invisible.
+ * TWO gates, and both matter:
+ *
+ *   COMPILE TIME  -DSOPK_STUB_LOG. Off by default. Without it this header emits
+ *                 nothing at all - no tag, no "/dev/socket/logdw", no staged
+ *                 message strings, no socket/connect/gettid syscall numbers.
+ *   RUN TIME      SOPK_FLAG_LOG in decinfo.flags (config: logging.stub-log),
+ *                 which selects between logging and not in a stub that HAS the
+ *                 code.
+ *
+ * The compile-time gate is new, and it exists because this comment used to say
+ * "when off, the code is compiled in but never called, so it is invisible" -
+ * which is true of logcat and false of `strings`. A default-built stub shipped
+ * all 14 staged messages in every packed library, including the self-describing
+ * "H:native .text decrypted OK", plus the logd socket path. The XOR-obfuscated
+ * tag below was hiding the packer's name while the narration beside it was in
+ * cleartext. See docs/technical/STATIC-ANALYSIS-REVIEW.md S7.
+ *
+ * Consequence: a default stub cannot honour logging.stub-log, so sopack refuses
+ * that combination rather than silently ignoring it (stubs.py records which
+ * kind of blob this is in the JSON sidecar).
  *
  * Wire format of one datagram to logdw:
  *   [id:u8=LOG_ID_MAIN][tid:u16][tv_sec:u32][tv_nsec:u32][prio:u8][tag\0][msg\0]
@@ -15,6 +33,8 @@
 #define SOPK_LOG_H
 
 #include "syscalls.h"
+
+#ifdef SOPK_STUB_LOG
 
 #if defined(__aarch64__)
 #define SOPK_NR_socket 198
@@ -127,5 +147,15 @@ static inline void sopk_logv(const char *prefix, unsigned long v) {
   msg[o] = 0;
   sopk_logcat(msg);
 }
+
+#else /* !SOPK_STUB_LOG */
+
+/* Macros, not empty inline functions: the argument is never evaluated, so the
+ * string literals at the call sites are unreferenced and never reach .rodata.
+ * An empty inline function taking `const char *` would still anchor them. */
+#define sopk_logcat(msg) ((void)0)
+#define sopk_logv(prefix, v) ((void)0)
+
+#endif /* SOPK_STUB_LOG */
 
 #endif /* SOPK_LOG_H */

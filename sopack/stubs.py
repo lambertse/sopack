@@ -27,6 +27,16 @@ class Stub:
     blob: bytes
     entry_off: int      # byte offset of sopk_entry within blob
     decinfo_off: int    # byte offset of g_decinfo within blob
+    # Was this blob built with -DSOPK_STUB_LOG? Logging is compiled OUT by default, because a
+    # logging build ships all 14 staged messages plus "/dev/socket/logdw" in every packed
+    # library - they used to be gated only at runtime, which `strings` ignores. So
+    # `logging.stub-log: true` is only honourable by a --with-log blob, and the packer refuses
+    # the mismatch rather than silently doing nothing.
+    #
+    # Defaults False for a sidecar written before this field existed: absent means a stub from
+    # the era when logging was always compiled in, and the honest reading of "I do not know" is
+    # to refuse the combination rather than assume it works.
+    log: bool = False
 
 
 class StubMissingError(FileNotFoundError):
@@ -49,7 +59,8 @@ def load_stub(abi: str) -> Stub:
         raise ValueError(f"{blob_path.name}: size mismatch with metadata")
     return Stub(abi=abi, blob=blob,
                 entry_off=int(meta["entry_off"]),
-                decinfo_off=int(meta["decinfo_off"]))
+                decinfo_off=int(meta["decinfo_off"]),
+                log=bool(meta.get("log", False)))
 
 
 # ---- wbaes helper skeleton (cipher: wbaes) ----------------------------------------

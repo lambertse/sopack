@@ -2,7 +2,8 @@
   "abi": "armeabi-v7a",
   "triple": "armv7a-linux-androideabi24",
   "api": 24,
-  "size": 6405,
-  "entry_off": 1680,
-  "decinfo_off": 6277
+  "size": 2400,
+  "entry_off": 880,
+  "decinfo_off": 2272,
+  "log": false
 }

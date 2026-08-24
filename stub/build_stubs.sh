@@ -21,7 +21,21 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$HERE/../sopack/stubs"
-API="${1:-24}"
+
+# API level is positional (historically `build_stubs.sh 24`), and --with-log is a flag, so the
+# flag has to be filtered out before ${1} is read as the API - otherwise `build_stubs.sh
+# --with-log` would silently build for API "--with-log" and fail deep inside clang.
+WITH_LOG=0
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        --with-log) WITH_LOG=1 ;;
+        -h|--help)  sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0 ;;
+        -*)         echo "ERROR: unknown option: $arg" >&2; exit 2 ;;
+        *)          POSITIONAL+=("$arg") ;;
+    esac
+done
+API="${POSITIONAL[0]:-24}"
 mkdir -p "$OUT"
 
 # ABI:triple pairs. Kept as a plain space-separated list (not a bash-4 associative
@@ -49,12 +63,22 @@ else
     echo "toolchain: plain LLVM ($CLANG)"
 fi
 
+# Logging is OFF by default, and that is a HARDENING decision, not a convenience one.
+# A logging build carries all 14 staged messages, "/dev/socket/logdw" and the obfuscated tag in
+# every packed library - including the self-describing "H:native .text decrypted OK". They used
+# to ship unconditionally, gated only at runtime; `strings` does not care about runtime gates.
+# Building without them also shrinks the arm64 blob from 6713 to ~2256 bytes, i.e. two thirds
+# less injected code to reverse. See docs/technical/STATIC-ANALYSIS-REVIEW.md S7.
+#
+# `logging.stub-log: true` needs a stub built WITH this flag; the JSON sidecar records which
+# kind each blob is so the packer can refuse the mismatch instead of silently ignoring it.
 CFLAGS=(
     -Os -fPIC -fno-plt -ffreestanding -nostdlib
     -fvisibility=hidden -fno-stack-protector -fno-jump-tables
     -fno-asynchronous-unwind-tables -fno-unwind-tables
     -fno-builtin -fomit-frame-pointer -std=c11 -Wall -Wextra
 )
+[[ "$WITH_LOG" -eq 1 ]] && CFLAGS+=(-DSOPK_STUB_LOG)
 LDFLAGS=(
     -nostdlib -static -fuse-ld=lld -Wl,--build-id=none -Wl,-e,sopk_entry
     -Wl,--no-dynamic-linker -Wl,--gc-sections
@@ -121,7 +145,8 @@ for PAIR in $TARGETS; do
   "api": $API,
   "size": $SIZE,
   "entry_off": $((ENTRY_OFF)),
-  "decinfo_off": $((INFO_OFF))
+  "decinfo_off": $((INFO_OFF)),
+  "log": $([[ "$WITH_LOG" -eq 1 ]] && echo true || echo false)
 }
 EOF
     echo "   -> $BLOB ($SIZE bytes)  entry=+$((ENTRY_OFF))  decinfo=+$((INFO_OFF))"

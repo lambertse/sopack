@@ -1184,6 +1184,18 @@ def inject_so(in_path: str, out_path: str, abi: str,
         return _inject_wbaes(in_path, out_path, abi, wb_keygen, target_name,
                              allow_helper_log=allow_helper_log, pack_key=pack_key)
     stub: Stub = load_stub(abi)
+    # logging.stub-log needs a stub built with -DSOPK_STUB_LOG. A default stub has the logging
+    # code compiled out entirely, so honouring the flag would produce an artifact that silently
+    # never logs - the same "you believe you turned something on and did not" failure the config
+    # layer refuses everywhere else. Logging is off by default because a logging stub ships all
+    # 14 staged messages and /dev/socket/logdw in EVERY packed library.
+    if log and not stub.log:
+        raise InjectError(
+            f"logging.stub-log is set, but the {abi} stub was built without logging support. "
+            f"It is compiled out by default: a logging stub ships its staged messages and "
+            f"/dev/socket/logdw in every packed library, gated only at runtime, which `strings` "
+            f"ignores. Rebuild with `bash stub/build_stubs.sh --with-log`, or unset "
+            f"logging.stub-log.")
     cipher_id = CIPHER_IDS[cipher]
     # Whitening span: the WHITEN_SPAN stub bytes immediately before g_decinfo - real
     # code/rodata the injector never rewrites (only g_decinfo, at decinfo_off, is patched).

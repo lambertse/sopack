@@ -2,7 +2,8 @@
   "abi": "arm64-v8a",
   "triple": "aarch64-linux-android24",
   "api": 24,
-  "size": 6873,
-  "entry_off": 1464,
-  "decinfo_off": 6745
+  "size": 2256,
+  "entry_off": 808,
+  "decinfo_off": 2128,
+  "log": false
 }
