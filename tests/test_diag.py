@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -62,13 +63,56 @@ def test_default_is_under_the_dot_sopack_home(monkeypatch):
 
 
 # ---- run ids -----------------------------------------------------------------------------
-def test_run_id_is_sortable_and_unique():
-    """Lexicographic order must equal chronological order, because pruning picks the oldest by
-    sorting names. And two packs in the same second must not collide on a directory."""
+def test_run_id_is_sortable():
+    """Lexicographic order must equal chronological order, because `report._prune_runs` picks the
+    oldest by sorting directory NAMES - nothing reads an mtime."""
     ids = [diag._run_id("app.apk") for _ in range(50)]
-    assert len(set(ids)) == 50, "same-second collisions"
-    assert ids == sorted(ids, key=lambda s: s[:15]) or True
+    stamps = [i[:15] for i in ids]
+    assert stamps == sorted(stamps), "the timestamp prefix does not sort chronologically"
     assert all(i.startswith("20") and i.endswith("-app") for i in ids)
+
+
+def test_run_id_salt_is_wide_enough_for_a_batch():
+    """A birthday check on the salt, not a uniqueness draw.
+
+    This assertion used to be `len(set(50 ids)) == 50` against a TWO-byte salt, which fails
+    ~1.6% of the time - once every ~60 runs - and was written off as container flakiness. The
+    real reading is that a 50-APK batch had the same ~1.6% chance of two runs landing in one
+    directory. Test the parameter, so the property holds by construction instead of by luck.
+    """
+    salt = diag._run_id("app.apk").split("-")[2]
+    space = 16 ** len(salt)
+    batch = 200                                     # config default max-runs
+    collision = 1 - math.exp(-batch * (batch - 1) / (2 * space))
+    assert collision < 1e-4, (
+        f"{len(salt)} hex chars of salt: a {batch}-pack batch collides with p={collision:.2%}")
+
+
+def test_open_run_never_reuses_a_run_directory(tmp_path, monkeypatch):
+    """The salt is probabilistic; this is the part that is not.
+
+    Two runs sharing a directory interleave run.log and let the second report.json overwrite the
+    first - silently, because `os.makedirs(..., exist_ok=True)` cannot tell the caller it just
+    joined someone else's run. Force the collision rather than wait for a 1-in-N one.
+    """
+    cfg = _logfile(dir=str(tmp_path))
+    diag.bootstrap()
+    first = diag.open_run(cfg, "app.apk")
+
+    calls = {"n": 0}
+    real = diag._run_id
+
+    def colliding(name):
+        calls["n"] += 1
+        return first if calls["n"] == 1 else real(name)
+
+    monkeypatch.setattr(diag, "_run_id", colliding)
+    second = diag.open_run(cfg, "app.apk")
+
+    assert second != first, "open_run reused a directory that already existed"
+    assert (tmp_path / "runs" / first).is_dir()
+    assert (tmp_path / "runs" / second).is_dir()
+    assert calls["n"] == 2, "the retry did not re-roll the id"
 
 
 @pytest.mark.parametrize("hostile,forbidden", [
