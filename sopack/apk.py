@@ -221,6 +221,13 @@ class RepackResult:
     # record - not because it is secret (it is not; the stub ships) but because "which shape
     # did THIS app get?" is otherwise unanswerable.
     obf_seed: int | None = None
+    # True when a TRACING helper was allowed into the output (logging.allow-helper-log). Such a
+    # helper narrates the whole protocol in cleartext English format strings - target soname,
+    # .text RVA and size, per-stage timings - which is exactly the leak HARDENING.md Method 5
+    # exists to prevent. This has demonstrably reached a real output APK once
+    # (docs/technical/STATIC-ANALYSIS-REVIEW.md S5), so the artifact is marked rather than
+    # relying on whoever ran the pack to remember.
+    helper_log_allowed: bool = False
     # Protected libraries that ALSO ship, unencrypted, under an ABI this pack did not cover -
     # in the SAME container. Each entry is (protected_entry, [cleartext_entry, ...]).
     #
@@ -369,7 +376,14 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
     excludes = build_excludes(exclude_libs)
     abis_set = set(abis)
     cont = container or detect_container(in_apk)
-    result = RepackResult(output=out_apk, container=cont.kind)
+    result = RepackResult(output=out_apk, container=cont.kind,
+                          helper_log_allowed=allow_helper_log)
+    if allow_helper_log:
+        diag.warn(
+            "logging.allow-helper-log is set: a TRACING helper may be injected. Such a helper "
+            "prints the target soname, its .text address and size, and per-stage timings to "
+            "logcat, and ships those strings in cleartext in every packed library. The result "
+            "is a diagnostic artifact - DO NOT SHIP IT.")
 
     # wbaes preflight: resolve a RUNNABLE host wb_keygen now, so a wrong tool fails before we
     # start injecting (not mid-pack). Also surfaces the Android-vs-host mistake up front.

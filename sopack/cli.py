@@ -301,6 +301,14 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
         diag.emit("\nSignature:")
         diag.emit(verify_signature(args.output, min_sdk=cfg.signing.min_sdk))
     diag.emit(f"\nDone: {args.output}")
+    # Last line the operator reads, deliberately. A tracing helper narrates the entire design in
+    # cleartext English inside every packed library, so this artifact is a diagnostic, not a
+    # release. It reached a real output APK once (STATIC-ANALYSIS-REVIEW.md S5) - a config key
+    # set once and forgotten is exactly how.
+    if getattr(res, "helper_log_allowed", False):
+        diag.warn("Note: built with logging.allow-helper-log - a TRACING helper may be inside. "
+                  "It ships the target soname, .text address and size, and per-stage timings as "
+                  "cleartext strings. DO NOT SHIP THIS ARTIFACT; rebuild without that key.")
     if res.signed:
         diag.emit("Note: re-signed with a new certificate - this is a new app identity "
                   "(cannot update-install over the original).")

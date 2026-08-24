@@ -96,6 +96,9 @@ def build(cfg, res, *, input_apk, output_apk, exit_code, error, config_source,
         # The O-MVLL seed for a polymorphic pack, else null. Not a secret - the stub ships -
         # but it is the only handle that reproduces THIS app's stub shape after the fact.
         "obf_seed": getattr(res, "obf_seed", None),
+        # True when a tracing helper was permitted. A batch consumer filtering for
+        # "artifacts that must not ship" wants this alongside `signed`.
+        "helper_log_allowed": bool(getattr(res, "helper_log_allowed", False)),
         # None (not False) when we never got as far as signing, so a consumer can tell "left
         # unsigned" apart from "never reached that stage".
         "signed": getattr(res, "signed", None) if res is not None else None,
