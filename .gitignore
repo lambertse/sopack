@@ -76,3 +76,9 @@ sopack-bundle-*.tar.gz
 # config.yaml at the repo root - the natural place to run init-config, right beside the sample -
 # would otherwise be picked up by every harness run without saying so.
 /config.yaml
+
+# O-MVLL writes this at PLUGIN INIT - before it even reads its Python config - into whatever
+# directory the compiler was invoked from. sopack/obfuscate.py sets cwd to its temp build dir so
+# a pack cleans up after itself, but a manual `bash stub/build_stubs.sh` from the repo root
+# leaves it here, and a `git add -A` then commits it (which is exactly what happened once).
+omvll-logs/
