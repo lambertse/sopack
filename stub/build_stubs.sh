@@ -84,11 +84,21 @@ if [[ -n "$NDK" ]]; then
     NDK_REV="$(sed -n 's/^Pkg\.Revision *= *//p' "$NDK/source.properties" 2>/dev/null | head -1 || true)"
     # Name the NDK, the host tag AND which variable supplied the path. Without this the failure
     # is bash's bare "No such file or directory" on a clang nobody asked for, which says nothing
-    # about the environment variable that chose it.
-    if [[ ! -x "$CLANG" ]]; then
+    # about the environment variable that chose it. Resolved here rather than inside the first
+    # guard that needs it, because the ld.lld guard below names it too and a second copy of this
+    # precedence rule is a second place for it to drift out of step with the $NDK assignment
+    # above. An if/elif chain rather than the `[[ ... ]] && WHICH_VAR=...` pair it replaced: that
+    # form is safe under `set -e` (a failed test on the left of `&&` is exempt) but it states the
+    # order twice, once negated, and this now runs on every build rather than only on the way to
+    # an exit.
+    if [[ -n "${ANDROID_NDK_HOME:-}" ]]; then
+        WHICH_VAR="\$ANDROID_NDK_HOME"
+    elif [[ -n "${ANDROID_NDK_ROOT:-}" ]]; then
+        WHICH_VAR="\$ANDROID_NDK_ROOT"
+    else
         WHICH_VAR="\$NDK"
-        [[ -n "${ANDROID_NDK_HOME:-}" ]] && WHICH_VAR="\$ANDROID_NDK_HOME"
-        [[ -z "${ANDROID_NDK_HOME:-}" && -n "${ANDROID_NDK_ROOT:-}" ]] && WHICH_VAR="\$ANDROID_NDK_ROOT"
+    fi
+    if [[ ! -x "$CLANG" ]]; then
         echo "ERROR: no clang at $CLANG
        That path came from $WHICH_VAR=$NDK (host tag $HOSTTAG, Pkg.Revision ${NDK_REV:-unknown}).
        NDKs are per-host and not interchangeable: a macOS NDK has only prebuilt/darwin-x86_64
@@ -194,11 +204,29 @@ fi
 # LDFLAGS ask for lld unconditionally, and a driver with no ld.lld beside it fails with
 # "invalid linker name in argument '-fuse-ld=lld'" - the second half of the stale-NDK signature
 # above, and a pre-r18 NDK / Apple clang tell on its own. Say so before the first compile.
-if ! "$(dirname "$CLANG")/ld.lld" --version >/dev/null 2>&1 && ! command -v ld.lld >/dev/null; then
-    echo "ERROR: no ld.lld beside $CLANG (nor on PATH), but the stub links with -fuse-ld=lld.
+#
+# THE CHECK IS BRANCH-SPECIFIC, and that is the whole point of it. It used to be a single test
+# that accepted an ld.lld from $PATH whichever branch chose the compiler, which made it a no-op
+# on any host with the distro `lld` package installed - including docker/'s own builder image
+# (Dockerfile installs `clang lld`, so /usr/bin/ld.lld is always there). A stale or broken NDK
+# then sailed past the guard and died much later as "missing symbols in arm64-v8a", naming
+# neither the linker nor the NDK. For an NDK the linker must be the NDK's own: a host lld is
+# outside the pinned toolchain. `-x` rather than `--version` because the question is presence,
+# not whether this host can execute that particular binary.
+if [[ -n "$NDK" ]]; then
+    if [[ ! -x "$BIN/ld.lld" ]]; then
+        echo "ERROR: no ld.lld beside $CLANG, but the stub links with -fuse-ld=lld.
        The stub is freestanding and linked with a custom script ($HERE/stub.ld); lld is not
        optional here. An NDK r18+ bundles ld.lld in the same bin/ as clang - if this is an NDK,
-       it is too old (or ANDROID_NDK_HOME points at something else)." >&2
+       it is too old (or $WHICH_VAR=$NDK points at something else). An ld.lld on PATH is
+       deliberately NOT accepted here: it is outside the NDK this build is pinned to. Unset
+       $WHICH_VAR to build with a plain LLVM on PATH instead." >&2
+        exit 1
+    fi
+elif ! "$(dirname "$CLANG")/ld.lld" --version >/dev/null 2>&1 && ! command -v ld.lld >/dev/null; then
+    echo "ERROR: no ld.lld beside $CLANG (nor on PATH), but the stub links with -fuse-ld=lld.
+       The stub is freestanding and linked with a custom script ($HERE/stub.ld); lld is not
+       optional here. Install the LLVM linker (the 'lld' package) beside the clang above." >&2
     exit 1
 fi
 

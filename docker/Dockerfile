@@ -98,10 +98,17 @@ RUN set -eu; \
 #                a --system-site-packages venv, so a dependency missing from this layer sends
 #                that install to PyPI and an offline run dies there. Keep in step with
 #                pyproject.toml's `dependencies`.
-#   setuptools   the build backend for `pip install -e` and for the bundle's own wheel. Present
-#                explicitly because artifact_generation.sh tries an ISOLATED wheel build first,
-#                which would otherwise want to download it.
-RUN pip3 install --no-cache-dir --break-system-packages \
+#   setuptools   the build backend for `pip install -e` and for the bundle's own wheel - and the
+#                one package here that PEP 517 build isolation would re-download into a throwaway
+#                env, ignoring this layer entirely. The entrypoint therefore passes
+#                --no-build-isolation so the editable install resolves the backend from HERE, and
+#                artifact_generation.sh tries an isolated wheel build first and falls back to the
+#                same flag. Remove it from this layer and both break, offline.
+# --retries/--timeout are not belt-and-braces: this layer pulls ~4 MB from files.pythonhosted.org
+# and pip's default 15 s read timeout aborts the WHOLE layer on one stall - observed dying 2.4 MB
+# into lief at 11 kB/s, after the 35-minute apt layer above it had already been paid for. The
+# retry is per-request, so a slow link now costs time instead of a failed build.
+RUN pip3 install --no-cache-dir --break-system-packages --retries 10 --timeout 120 \
         pytest 'lief>=1.0' 'pyyaml>=6' 'setuptools>=68' wheel
 
 # ---- Android NDK r29 --------------------------------------------------------------------

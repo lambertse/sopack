@@ -30,6 +30,30 @@ WBC="$SOPACK/third_party/whitebox-cryptography"
 [ -d "$OUTROOT" ] || die "no output directory bind-mounted at $OUTROOT.
        Run with: -v \"\$PWD/out:/out\"   (so the bundle survives the container)"
 
+# HOME. Docker hands a `--user $(id -u):$(id -g)` uid with no /etc/passwd entry HOME=/, and that
+# degenerate value is not cosmetic - it breaks two things, one loudly and one in silence:
+#   * the submodule's archive gate greps libwbcrypto.a for "${ROOT}|${HOME}|/Users/|/home/", so
+#     HOME=/ collapses the ${HOME} alternative to a bare "/" and EVERY line holding a slash reads
+#     as a leaked host path - ar member headers (/0, /1022), the long-name table (//), binary
+#     noise. A clean, DWARF-free archive then die()s as "embeds host paths - -g0/-ffile-prefix-map
+#     did not take effect", naming the one thing that is not wrong, and the run stops before the
+#     DWARF check, the wbc_blob_kdf_tier symbol check and the copy into vendor/wbc/.
+#   * sopack's host log defaults to ~/.sopack/logs, i.e. /.sopack/logs, which a non-root uid
+#     cannot create - and log failures are deliberately swallowed (warn once, keep packing), so
+#     the run records just never appear.
+# Point it somewhere writable, for the same reason the venv lives under /tmp. A caller who
+# exports a usable HOME keeps it. Export SOPACK_LOG_DIR (it outranks the config) if the run log
+# should survive the container.
+if [ -z "${HOME:-}" ] || [ "$HOME" = "/" ] || [ ! -w "$HOME" ]; then
+    export HOME=/tmp/sopack-home
+fi
+mkdir -p "$HOME" 2>/dev/null || true
+[ -n "$HOME" ] && [ "$HOME" != "/" ] && [ -d "$HOME" ] && [ -w "$HOME" ] \
+    || die "HOME=$HOME is empty, / or not writable. Leave HOME unset (this script then uses
+       /tmp/sopack-home) or point it at a writable directory: the submodule's host-path gate
+       greps libwbcrypto.a for \$HOME, and a degenerate value matches every path-like string
+       in it, failing a perfectly clean archive."
+
 # The bundle lands in /out, but the BUILD writes into the mounted checkout: vendor/wbc/,
 # sopack/stubs/*.so and the submodule's build-host/ + build-android/. All are gitignored and
 # regenerable, so this is safe - except that they are per-host, and replacing a Mac's copies
@@ -117,7 +141,23 @@ say "installing sopack (editable) into a venv"
 VENV=/tmp/sopack-venv
 python3 -m venv --system-site-packages "$VENV" || die "python3 -m venv failed"
 export PATH="$VENV/bin:$PATH"
-"$VENV/bin/pip" install --quiet --no-cache-dir -e "$SOPACK" \
+#    --no-build-isolation because PEP 517 build isolation is a NETWORK CALL that the pre-staged
+#    dependency layer does not cover. pip builds sopack's wheel in a fresh throwaway env and
+#    resolves pyproject.toml's `[build-system] requires = ["setuptools>=68"]` from PyPI *there*,
+#    ignoring the setuptools already installed system-wide - so the layer that exists to make
+#    this offline is bypassed by the one install it was built for. On a slow or absent link that
+#    is a multi-minute ReadTimeoutError against files.pythonhosted.org, ~2.5 GB of NDK layers
+#    into the run, surfacing as "pip install -e /workspace failed" with pip insisting it is "not
+#    a problem with pip". The image's pip layer carries setuptools>=68 and wheel precisely so the
+#    local backend can do this build, and --system-site-packages is what makes them visible here.
+#    artifact_generation.sh tries an isolated wheel build first and falls back, because it cannot
+#    assume a baked-in layer; this script can, so it goes straight to the local backend.
+python3 -c 'import setuptools' 2>/dev/null \
+    || die "setuptools is not importable in $VENV, so the --no-build-isolation install below has
+       no build backend. It comes from the image's system pip layer (docker/Dockerfile) via
+       --system-site-packages - rebuild the image. Do not drop the flag to work around this: that
+       turns every run into a PyPI download and re-breaks the offline path."
+"$VENV/bin/pip" install --quiet --no-cache-dir --no-build-isolation -e "$SOPACK" \
     || die "pip install -e $SOPACK failed"
 python3 -c 'import sopack, lief, yaml' \
     || die "sopack/lief/pyyaml not importable from $VENV after install"

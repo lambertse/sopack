@@ -43,10 +43,12 @@ docker build --platform linux/amd64 -f docker/Dockerfile --build-arg WBC_REF=<sh
 
 ```bash
 mkdir -p out
-docker run --rm --platform linux/amd64 \
-    -v "$PWD:/workspace" -v "$PWD/out:/out" \
-    --user "$(id -u):$(id -g)" \
-    sopack-bundler --tar
+docker run --rm --platform linux/amd64 --network none \ 
+  -v "$PWD:/workspace" -v "$PWD/out:/out" \            
+  --user "$(id -u):$(id -g)" \
+  --entrypoint bash \
+  sopack-bundler /workspace/docker/docker-entrypoint.sh --tar --force
+
 ```
 
 Arguments after the image name go straight to `artifact_generation.sh` (`--abi`, `--api`,
@@ -59,6 +61,38 @@ the bundle at the mount root the tarball would land inside the container and be 
 entrypoint installs sopack into a venv under `/tmp` instead of the system `dist-packages`, which
 a non-root uid cannot write to. Drop it if your Docker setup makes the bind mounts unwritable to
 your uid; you will then need to `sudo chown -R "$(id -u):$(id -g)" out` afterwards.
+
+That uid has no `/etc/passwd` entry, so Docker sets `HOME=/` for it — and `/` is not a harmless
+default here. The submodule's archive gate greps `libwbcrypto.a` for `${ROOT}|${HOME}|/Users/|/home/`,
+so a bare `/` matches every path-like string in an ar archive and a clean, DWARF-free `.a` dies as
+`embeds host paths — -g0/-ffile-prefix-map did not take effect`. `~/.sopack/logs` becomes
+`/.sopack/logs` too, which the same uid cannot create, and sopack swallows log-directory failures
+by design — so the run records silently never appear. The entrypoint therefore repoints `HOME` at
+`/tmp/sopack-home` whenever it is unset, `/`, or unwritable, and keeps a usable one you export
+yourself. Set `SOPACK_LOG_DIR` (it outranks the config) if you want the run log to survive the
+container.
+
+**Iterating on the entrypoint without rebuilding.** `docker-entrypoint.sh` is `COPY`'d into the
+image, so an edit to it does nothing until `docker build` runs — and a rebuild wants network for
+the apt and pip layers, which is exactly what you may not have. The checkout is already mounted at
+`/workspace`, so run the edited copy directly instead:
+
+```bash
+docker run --rm --platform linux/amd64 --network none \
+    -v "$PWD:/workspace" -v "$PWD/out:/out" \
+    --user "$(id -u):$(id -g)" \
+    --entrypoint bash \
+    sopack-bundler /workspace/docker/docker-entrypoint.sh --tar --force
+```
+
+Everything else in the image — the NDK, the O-MVLL plugin, the pip layer, the pre-warmed WBC deps
+— is what the run uses either way. `--entrypoint bash` with the script as the first argument is
+the form to use: `--entrypoint /workspace/docker/docker-entrypoint.sh` also works, but only while
+the file keeps its exec bit through the bind mount, and when it does not the failure is a bare
+`permission denied` that reads like a broken mount. `--network none` needs the submodule already
+checked out on the host — with `third_party/whitebox-cryptography/include/wbcrypto.h` missing the
+entrypoint runs `git submodule update --init`, which needs the network it has just been denied.
+Fold the change into the image when you next have a good link.
 
 `--abi` is the **Android** target ABI and stays `arm64-v8a`. The x86_64 in play here is the
 *host*; the two are unrelated axes and conflating them is an easy mistake.

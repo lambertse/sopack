@@ -62,7 +62,13 @@ pip install -e .                            # install the CLI (pulls in LIEF + P
 # fetch_omvll.sh), else clang+lld+llvm-* on PATH. It has no --ndk; the wrapper scripts EXPORT
 # ANDROID_NDK_HOME from theirs (see the env invariant below). Its clang must exist, accept
 # -fpass-plugin when OMVLL_PLUGIN is set, and have ld.lld beside it - all three checked before
-# the first compile.
+# the first compile. The ld.lld check is BRANCH-SPECIFIC and must stay that way: under an NDK
+# only that NDK's own bin/ld.lld counts, and an ld.lld on PATH is REFUSED (it is outside the
+# pinned toolchain); only the plain-LLVM branch falls back to PATH, where clang came from PATH
+# too. One unscoped test that accepted either made the guard a no-op on every host with the
+# distro `lld` package - docker/'s builder image included - so a broken NDK reached the compile
+# loop and died as "missing symbols in arm64-v8a", and the suite passed on macOS while failing
+# in the container. tests/test_obfuscate.py parametrizes it over PATH for that reason.
 # Hard-fails if the blob has any relocation, undefined symbol, or (arm64) adrp.
 bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.bin + *.json
 bash stub/build_stubs.sh --with-log         # ...WITH logcat support compiled in. OFF by default:
@@ -1133,6 +1139,11 @@ network at run time, and both name their packages explicitly - a dependency adde
   sends that install to PyPI and an **offline run dies there** - after the ~2.5 GB of NDK layers.
   Prove it with `docker run --rm --network none`; without `--network none` the check silently
   passes by downloading.
+  That `pip install -e` must keep **`--no-build-isolation`**: PEP 517 isolation builds the wheel
+  in a throwaway env and resolves `[build-system] requires = ["setuptools>=68"]` from PyPI there,
+  bypassing this layer entirely - so the one install the layer exists for was the one that still
+  reached the network, and on a slow link it died as a `ReadTimeoutError` reported as
+  "pip install -e /workspace failed". The flag is why `setuptools>=68` must stay in the layer.
 - the bundle's generated `install.sh` (`scripts/artifact_generation.sh`), whose post-install probe
   imports each one by name. That probe exists because a dependency pip failed to resolve is
   otherwise invisible until the first pack, on the machine least equipped to diagnose it.

@@ -53,13 +53,24 @@ def test_config_dir_used_when_no_env(tmp_path, monkeypatch):
 
 
 def test_default_is_under_the_dot_sopack_home(monkeypatch):
-    """Beside ~/.sopack/debug.keystore, not /tmp: records accumulate across a batch and are what a
-    customer sends back a day later, so they must survive a reboot."""
+    """Beside ~/.sopack/debug.keystore: records accumulate across a batch and are what a customer
+    sends back a day later, so the default must follow $HOME rather than a scratch directory of
+    the tool's own choosing.
+
+    The last assertion used to be `not got.startswith("/tmp")`, which measured the ENVIRONMENT
+    rather than the code. A container legitimately runs with HOME under /tmp - Docker gives a
+    `--user $(id -u)` uid with no /etc/passwd entry HOME=/, which is not writable, so
+    docker/docker-entrypoint.sh repoints it at /tmp/sopack-home - and following that HOME is
+    sopack behaving correctly, not a regression. It failed there while passing on macOS, the same
+    shape as the unscoped ld.lld guard. Deriving the expected value from $HOME instead keeps the
+    regression it was aimed at: a hardcoded DEFAULT_LOG_DIR = "/tmp/.sopack/logs" satisfies both
+    assertions above and fails this one, on any host.
+    """
     monkeypatch.delenv(diag.ENV_LOG_DIR, raising=False)
     got = diag.resolve_dir(_logfile())
     assert got == diag.DEFAULT_LOG_DIR
     assert got.endswith(os.path.join(".sopack", "logs"))
-    assert not got.startswith("/tmp")
+    assert got == os.path.join(os.path.expanduser("~"), ".sopack", "logs")
 
 
 # ---- run ids -----------------------------------------------------------------------------

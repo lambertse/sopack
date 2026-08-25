@@ -321,7 +321,7 @@ exit 0
 '''
 
 
-def _run_build_stubs(tmp_path, ndk: Path, *, plugin: Path | None):
+def _run_build_stubs(tmp_path, ndk: Path, *, plugin: Path | None, path_lld: bool = False):
     env = {k: v for k, v in os.environ.items()
            if k not in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK",
                         "OMVLL_PLUGIN", "OMVLL_PYTHONPATH", "OMVLL_CONFIG")}
@@ -331,6 +331,17 @@ def _run_build_stubs(tmp_path, ndk: Path, *, plugin: Path | None):
     if plugin is not None:
         env["OMVLL_PLUGIN"] = str(plugin)
         env["OMVLL_CONFIG"] = str(REPO / "stub" / "omvll_config.py")
+    if path_lld:
+        # Put an ld.lld on $PATH that is NOT the fake NDK's. The host decides whether one is
+        # there otherwise (macOS: no; any Linux with the distro `lld` package, docker/'s builder
+        # image included: yes), so a guard that consults PATH passes or fails by accident of
+        # host. Adding it deliberately is what makes the assertion mean something on both.
+        shim = tmp_path / "path-bin"
+        shim.mkdir(exist_ok=True)
+        lld = shim / "ld.lld"
+        lld.write_text('#!/bin/sh\necho "LLD 20.0.0"\n')
+        lld.chmod(0o755)
+        env["PATH"] = f"{shim}{os.pathsep}{env.get('PATH', '')}"
     return subprocess.run(["bash", str(_BUILD_STUBS)], env=env, cwd=str(tmp_path),
                           capture_output=True, text=True)
 
@@ -368,13 +379,55 @@ def test_build_stubs_names_the_variable_that_supplied_a_bad_ndk(tmp_path):
     assert "$ANDROID_NDK_HOME" in r.stderr and str(empty) in r.stderr, r.stderr
 
 
-def test_build_stubs_requires_lld(tmp_path):
-    """LDFLAGS ask for -fuse-ld=lld unconditionally; a driver with no ld.lld beside it fails
-    with 'invalid linker name', the second half of the stale-NDK signature."""
+@pytest.mark.parametrize("path_lld", [False, True],
+                         ids=["no-lld-on-PATH", "unrelated-lld-on-PATH"])
+def test_build_stubs_requires_the_ndks_own_lld(tmp_path, path_lld):
+    """LDFLAGS ask for -fuse-ld=lld unconditionally; an NDK with no ld.lld beside its clang
+    fails with 'invalid linker name', the second half of the stale-NDK signature.
+
+    Parametrized over $PATH because the guard used to accept ANY ld.lld on it, which made it a
+    no-op on every host carrying the distro `lld` package - docker/'s own builder image among
+    them, where a fake NDK reached the compile loop and died as 'missing symbols in arm64-v8a'.
+    So the same suite passed on macOS and failed in the container. A host lld is outside the
+    pinned NDK; when an NDK selected the compiler, only that NDK's linker counts.
+    """
     ndk = _fake_ndk(tmp_path / "ndk", clang_body=_NEW_CLANG, with_lld=False)
-    r = _run_build_stubs(tmp_path, ndk, plugin=None)
+    r = _run_build_stubs(tmp_path, ndk, plugin=None, path_lld=path_lld)
     assert r.returncode != 0
     assert "no ld.lld beside" in r.stderr, r.stderr
+    assert "== building stub" not in r.stdout, "it compiled anyway - the guard failed open"
+
+
+def test_build_stubs_plain_llvm_branch_still_takes_lld_from_path(tmp_path):
+    """The other half of scoping that guard: with NO NDK set, clang itself comes from $PATH, so
+    the linker beside it may legitimately be a $PATH entry too (Debian ships clang and ld.lld in
+    the same /usr/bin, but a versioned LLVM does not). Refusing that would cost a toolchain that
+    works, which is worse than the accidental pass the NDK branch used to give."""
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    for name, body in (("clang", _NEW_CLANG),
+                       ("llvm-objcopy", "exit 0\n"), ("llvm-readelf", "exit 0\n")):
+        p = shim / name
+        p.write_text("#!/bin/sh\n" + body)
+        p.chmod(0o755)
+    lldbin = tmp_path / "lld-bin"          # deliberately NOT beside clang
+    lldbin.mkdir()
+    (lldbin / "ld.lld").write_text('#!/bin/sh\necho "LLD 20.0.0"\n')
+    (lldbin / "ld.lld").chmod(0o755)
+
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK",
+                        "OMVLL_PLUGIN", "OMVLL_PYTHONPATH", "OMVLL_CONFIG")}
+    env["SOPK_STUB_OUT"] = str(tmp_path / "out")
+    env["PATH"] = os.pathsep.join([str(shim), str(lldbin), env.get("PATH", "")])
+    r = subprocess.run(["bash", str(_BUILD_STUBS)], env=env, cwd=str(tmp_path),
+                       capture_output=True, text=True)
+    # Only these two, deliberately: that the PATH branch was taken and that the guard did not
+    # fire. Asserting the compile loop was reached as well would make the test depend on how far
+    # a fake clang gets on this particular host - which is the same host-dependence that let the
+    # lld guard pass on macOS and fail in the container.
+    assert "toolchain: plain LLVM" in r.stdout, r.stdout + r.stderr
+    assert "no ld.lld beside" not in r.stderr, r.stderr
 
 
 def test_build_stubs_warns_when_the_plugin_pin_and_the_ndk_disagree(tmp_path):
