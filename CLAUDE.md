@@ -58,7 +58,11 @@ pip install -e .                            # install the CLI (pulls in LIEF + P
 # lives in. --force redoes cached phases; --help lists everything.
 
 # The raw stub build the chacha20 script wraps (needed after ANY change to stub/*.c/*.h).
-# Uses the NDK if ANDROID_NDK_HOME/ANDROID_NDK_ROOT is set, else clang+lld+llvm-* on PATH.
+# Uses the NDK if ANDROID_NDK_HOME/ANDROID_NDK_ROOT/NDK is set (that order, matching
+# fetch_omvll.sh), else clang+lld+llvm-* on PATH. It has no --ndk; the wrapper scripts EXPORT
+# ANDROID_NDK_HOME from theirs (see the env invariant below). Its clang must exist, accept
+# -fpass-plugin when OMVLL_PLUGIN is set, and have ld.lld beside it - all three checked before
+# the first compile.
 # Hard-fails if the blob has any relocation, undefined symbol, or (arm64) adrp.
 bash stub/build_stubs.sh [API_LEVEL]        # default API 24 -> sopack/stubs/*.bin + *.json
 bash stub/build_stubs.sh --with-log         # ...WITH logcat support compiled in. OFF by default:
@@ -251,6 +255,16 @@ python -m pytest tests/test_obfuscate.py    # the polymorphic stub: config surfa
                                            #   (marked `slow`, skipped without the NDK+O-MVLL)
                                            #   that TWO SEEDS PRODUCE DIFFERENT WHITENING KEYS -
                                            #   the one property that kills the universal unpacker
+python -m pytest tests/test_environment.py # ONE test: `import sopack` must resolve INSIDE this
+                                           #   checkout. `pip install -e .` records an absolute
+                                           #   path, so a second clone runs its own tests/
+                                           #   against the FIRST clone's package - and which one
+                                           #   wins depends on how pytest started (`python -m
+                                           #   pytest` prepends CWD and picks this checkout;
+                                           #   bare `pytest` does not and picks the install).
+                                           #   build_wbaes.sh uses `python3 -m pytest`, so the
+                                           #   two disagreed silently: the script's run tested
+                                           #   the edits, a bare `pytest` next to it did not.
 python -m pytest tests/test_integration.py -k init_array   # a single test by name
 ```
 
@@ -858,6 +872,28 @@ would make precedence depend silently on insertion order.
     function symbol - that emits an unresolved arm64 relocation the build guard rejects.
   - The Python↔C whitening mirror is locked by the aarch64 `dlopen` integration test (it
     only decrypts if both sides agree); `test_metadata.py` pins the Python side via KAT.
+
+- **A script that GATES an NDK must export it, or a child compiles with a different one.**
+  `build_wbaes.sh`, `build_chacha20.sh`, `device_test.sh` and `artifact_generation.sh` all
+  resolve the toolchain into `$NDK` (`--ndk` wins). `stub/build_stubs.sh`, `sopack/obfuscate.py`
+  and `tests/test_obfuscate.py` read **ANDROID_NDK_HOME / ANDROID_NDK_ROOT** and know nothing
+  about `--ndk`. `build_wbaes.sh` validated `$NDK` (layout, `clang++`, `llvm-readelf`) and then
+  ran the suite **without exporting it**, so Phase 2's polymorphic-stub test compiled with
+  whatever stale `ANDROID_NDK_HOME` the shell carried - typically Android Studio's `ndk-bundle`.
+  The O-MVLL plugin is pinned to **NDK r29** (`fetch_omvll.sh` names it `omvll_ndk_r29.*`) and a
+  pass-plugin loads only into the clang it was built against, so an older clang rejects
+  `-fpass-plugin` outright: `./scripts/artifact_generation.sh` died inside a unit test whose
+  message named neither NDK. It now exports **both** `ANDROID_NDK_HOME` and `ANDROID_NDK_ROOT`
+  from `$NDK` right after the layout gate (inside the `HOST_ONLY -eq 0` block - `--host-only`
+  has no validated NDK to export). Note the failure was **silent about its cause, not silent**:
+  a run that dies in pytest reads as "sopack is broken", which is why the guards below name the
+  compiler, the `Pkg.Revision` and the variable that chose it.
+  `build_stubs.sh`'s `-fpass-plugin` probe is `PROBE_OUT="$(... || true)"` + a `[[ == * ]]` test
+  and must NOT be rewritten as `... | grep -q`: under `set -o pipefail` the pipeline reports the
+  probe's non-zero exit rather than grep's match, so the `if` never fires and the gate passes on
+  exactly the toolchain it exists to reject. `tests/test_obfuscate.py` drives all four guards
+  through real `bash` runs against a shimmed fake NDK (no toolchain needed), because a guard
+  nothing drives is not evidence of a guard.
 
 - **Init-hijack policy (the core correctness insight).** If the library has a usable
   `DT_INIT`, repoint it to the stub and chain the original (`DT_INIT-hijack`). Otherwise

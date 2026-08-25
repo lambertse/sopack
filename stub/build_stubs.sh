@@ -6,18 +6,34 @@
 #
 # The stub is freestanding (raw syscalls, no Android sysroot), so it can be built with
 # EITHER the Android NDK or a plain multi-target LLVM. Toolchain selection:
-#   * ANDROID_NDK_HOME / ANDROID_NDK_ROOT set  -> use the NDK's clang/llvm.
-#   * otherwise                                -> use clang / llvm-objcopy / llvm-readelf
-#                                                 from PATH (e.g. conda-forge LLVM).
+#   * ANDROID_NDK_HOME / ANDROID_NDK_ROOT / NDK  -> use that NDK's clang/llvm (first one set
+#                                                   wins; the wrapper scripts export
+#                                                   ANDROID_NDK_HOME from their own --ndk).
+#   * otherwise                                  -> use clang / llvm-objcopy / llvm-readelf
+#                                                   from PATH (e.g. conda-forge LLVM).
 # Output goes to sopack/stubs/ so the Python package can ship the blobs as data.
 #
 # Usage: ANDROID_NDK_HOME=/path/to/ndk ./build_stubs.sh [API_LEVEL]
 #    or: ./build_stubs.sh            # plain LLVM on PATH
 #
-# Requires an NDK r19+ (recommend r26-r28; must bundle lld - a real version looks like
-# 27.0.12077973, NOT 4.8.0) OR a modern LLVM (clang + lld + llvm-objcopy + llvm-readelf)
-# on PATH. Run with bash (>= 3.2), not sh.
+# Requires an NDK r19+ (must bundle lld - a real version looks like 27.0.12077973, NOT 4.8.0)
+# OR a modern LLVM (clang + lld + llvm-objcopy + llvm-readelf) on PATH. With OMVLL_PLUGIN set
+# the floor is higher and exact: -fpass-plugin needs clang 13+ (NDK r26+), and the vendored
+# plugin loads ONLY into the clang it was built against - r29, per scripts/fetch_omvll.sh. Both
+# are checked before the first compile rather than left to a clang error naming no NDK.
+# Run with bash (>= 3.2), not sh.
 set -euo pipefail
+
+# This script's only caller in the pack path is sopack/obfuscate.py, which reports the failed
+# build's stderr and nothing else. `set -e` + `pipefail` can end a run with rc=1 and NO output
+# at all - most easily through a command substitution whose pipeline fails - and that arrives as
+# "obfuscated stub build failed after 3 seeds; last error:" with nothing after the colon. An ERR
+# trap costs one line and makes every such exit name its own line number. It does not fire for
+# the deliberate `exit 1`s below (each already printed its reason), nor for a command failing
+# inside an `if`/`&&` condition, so it adds no noise to the guards.
+trap 'rc=$?; echo "ERROR: build_stubs.sh failed at line $LINENO (exit $rc) without a message of
+       its own - a command failed under set -e/pipefail. Reproduce with:
+       ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-} OMVLL_PLUGIN=${OMVLL_PLUGIN:-} bash $0" >&2' ERR
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Output dir: default ships into the package; SOPK_STUB_OUT lets the per-pack polymorphic path
@@ -46,18 +62,48 @@ TARGETS="arm64-v8a:aarch64-linux-android${API} \
 armeabi-v7a:armv7a-linux-androideabi${API} \
 x86_64:x86_64-linux-android${API}"
 
-NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
+# $NDK last: ANDROID_NDK_HOME/ROOT are what the callers export (scripts/build_wbaes.sh,
+# scripts/build_chacha20.sh both set ANDROID_NDK_HOME from their own --ndk/$NDK resolution), and
+# this order matches scripts/fetch_omvll.sh - the other script that resolves an NDK for the SAME
+# pinned plugin. Two scripts disagreeing about which variable wins is how the plugin ends up
+# loaded into a clang it was not built against.
+NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${NDK:-}}}"
 if [[ -n "$NDK" ]]; then
     HOSTTAG="$(uname | tr '[:upper:]' '[:lower:]')-x86_64"
     BIN="$NDK/toolchains/llvm/prebuilt/$HOSTTAG/bin"
     CLANG="$BIN/clang"
     OBJCOPY="$BIN/llvm-objcopy"
     READELF="$BIN/llvm-readelf"
-    echo "toolchain: NDK ($NDK)"
+    # `|| true` is load-bearing, and this cost a round trip to find: `sed` exits non-zero when
+    # source.properties is absent, `set -o pipefail` propagates that to the substitution, and
+    # `set -e` then kills the script MID-ASSIGNMENT - before any of the diagnostics below can
+    # print. The result was rc=1 with EMPTY stdout and stderr, which sopack/obfuscate.py reports
+    # as three retried seeds and "last error: " with nothing after it. Every command
+    # substitution in this file that can legitimately fail needs the same treatment; the ERR
+    # trap below is the backstop for the ones nobody predicted.
+    NDK_REV="$(sed -n 's/^Pkg\.Revision *= *//p' "$NDK/source.properties" 2>/dev/null | head -1 || true)"
+    # Name the NDK, the host tag AND which variable supplied the path. Without this the failure
+    # is bash's bare "No such file or directory" on a clang nobody asked for, which says nothing
+    # about the environment variable that chose it.
+    if [[ ! -x "$CLANG" ]]; then
+        WHICH_VAR="\$NDK"
+        [[ -n "${ANDROID_NDK_HOME:-}" ]] && WHICH_VAR="\$ANDROID_NDK_HOME"
+        [[ -z "${ANDROID_NDK_HOME:-}" && -n "${ANDROID_NDK_ROOT:-}" ]] && WHICH_VAR="\$ANDROID_NDK_ROOT"
+        echo "ERROR: no clang at $CLANG
+       That path came from $WHICH_VAR=$NDK (host tag $HOSTTAG, Pkg.Revision ${NDK_REV:-unknown}).
+       NDKs are per-host and not interchangeable: a macOS NDK has only prebuilt/darwin-x86_64
+       and a Linux one only prebuilt/linux-x86_64. Point $WHICH_VAR at an NDK for THIS host,
+       or unset it to build with a plain LLVM on PATH." >&2
+        exit 1
+    fi
+    echo "toolchain: NDK ($NDK, Pkg.Revision ${NDK_REV:-unknown})"
 else
-    CLANG="$(command -v clang)"
-    OBJCOPY="$(command -v llvm-objcopy)"
-    READELF="$(command -v llvm-readelf)"
+    # `|| true` on each: `set -e` kills the script on a failed assignment, so without it the
+    # message below - the one that names what to install - was unreachable, and a host with no
+    # toolchain at all got a silent exit 1.
+    CLANG="$(command -v clang || true)"
+    OBJCOPY="$(command -v llvm-objcopy || true)"
+    READELF="$(command -v llvm-readelf || true)"
     if [[ -z "$CLANG" || -z "$OBJCOPY" || -z "$READELF" ]]; then
         echo "ERROR: need either ANDROID_NDK_HOME or clang+llvm-objcopy+llvm-readelf on PATH" >&2
         exit 1
@@ -104,8 +150,56 @@ if [[ -n "${OMVLL_PLUGIN:-}" ]]; then
     [[ -f "$OMVLL_CONFIG" ]] || { echo "ERROR: OMVLL_CONFIG=$OMVLL_CONFIG not found - without a
        config the plugin loads but applies NO passes, i.e. an unobfuscated build that looks
        obfuscated." >&2; exit 1; }
+    # Does THIS clang even know the flag? A pass-plugin only loads into the clang it was built
+    # against, and the vendored plugin is pinned to NDK r29 (scripts/fetch_omvll.sh names it
+    # omvll_ndk_r29.*), so a stale ANDROID_NDK_HOME - or Apple clang from PATH - fails with
+    # "unknown argument: '-fpass-plugin=…'" plus "invalid linker name in argument '-fuse-ld=lld'"
+    # for every ABI and every retried seed. Probed here, once, because the caller that hits this
+    # is sopack/obfuscate.py: it retries three seeds and reports only the LAST clang error, which
+    # names neither the compiler nor the NDK that produced it.
+    # A clang that knows the flag complains about the missing library instead, so "unknown
+    # argument" is the discriminator; -fsyntax-only keeps the probe from needing a target or a
+    # sysroot, and does not load the plugin.
+    # Captured into a variable rather than piped into grep on purpose: under `set -o pipefail`
+    # the pipeline reports the PROBE's non-zero exit, not grep's match, so the `if` never fires
+    # and the check silently passes on exactly the toolchain it exists to reject.
+    PROBE_OUT="$("$CLANG" -fsyntax-only -fpass-plugin=/nonexistent -x c /dev/null 2>&1 || true)"
+    if [[ "$PROBE_OUT" == *"unknown argument"* ]]; then
+        echo "ERROR: $CLANG does not support -fpass-plugin, so it cannot load the O-MVLL plugin.
+       clang: $("$CLANG" --version 2>&1 | head -1)
+       plugin: $OMVLL_PLUGIN (pinned to NDK r29 - a plugin loads only into the clang it was
+       built against, so the NDK pin and the O-MVLL pin move together).
+       -fpass-plugin needs clang 13+, i.e. NDK r26+. This is the toolchain selected above:
+       point ANDROID_NDK_HOME at the r29 NDK (scripts/build_wbaes.sh --ndk PATH exports it for
+       the whole run), or unset OMVLL_PLUGIN to build an UNOBFUSCATED stub - which is
+       byte-identical in every app, so its whitening key is a public constant." >&2
+        exit 1
+    fi
+    # A capable clang from the WRONG NDK gets as far as "unable to load plugin", which names the
+    # plugin but not the version to install. The plugin filename encodes the NDK it was built
+    # against (fetch_omvll.sh: omvll_ndk_r29.*), so compare the two and say it up front.
+    # A WARNING, not a gate: only Google's own major is encoded either side, so this cannot tell
+    # a genuinely compatible pair from a mismatched one - and refusing a setup that works is
+    # worse than a line of output on one that does not.
+    PLUGIN_NDK="$(basename "$OMVLL_PLUGIN" | sed -n 's/.*_r\([0-9]\{1,\}\).*/\1/p')"
+    if [[ -n "$PLUGIN_NDK" && -n "${NDK_REV:-}" && "${NDK_REV%%.*}" != "$PLUGIN_NDK" ]]; then
+        echo "WARNING: the O-MVLL plugin is built for NDK r$PLUGIN_NDK, but this NDK is
+       Pkg.Revision $NDK_REV. An LLVM pass-plugin loads only into the clang it was built
+       against, so expect 'unable to load plugin' below. Install NDK r$PLUGIN_NDK." >&2
+    fi
     OMVLL_FLAGS=(-fpass-plugin="$OMVLL_PLUGIN")
     echo "obfuscation: O-MVLL ($OMVLL_PLUGIN)  config=$OMVLL_CONFIG  seed=${SOPK_SEED:-<none>}"
+fi
+
+# LDFLAGS ask for lld unconditionally, and a driver with no ld.lld beside it fails with
+# "invalid linker name in argument '-fuse-ld=lld'" - the second half of the stale-NDK signature
+# above, and a pre-r18 NDK / Apple clang tell on its own. Say so before the first compile.
+if ! "$(dirname "$CLANG")/ld.lld" --version >/dev/null 2>&1 && ! command -v ld.lld >/dev/null; then
+    echo "ERROR: no ld.lld beside $CLANG (nor on PATH), but the stub links with -fuse-ld=lld.
+       The stub is freestanding and linked with a custom script ($HERE/stub.ld); lld is not
+       optional here. An NDK r18+ bundles ld.lld in the same bin/ as clang - if this is an NDK,
+       it is too old (or ANDROID_NDK_HOME points at something else)." >&2
+    exit 1
 fi
 
 sym_off() {  # sym_off <elf> <name> -> hex offset (== vaddr, image based at 0)
@@ -132,13 +226,21 @@ for PAIR in $TARGETS; do
     # full pass set exhausts AArch32's smaller register file in the freestanding stub ("ran out
     # of registers"); armv7 would need a lighter, 32-bit-specific set. arm64 is also the only
     # ABI protected in practice, so this is where it matters.
+    # `${arr[@]+"${arr[@]}"}` and not `"${arr[@]}"`: expanding an EMPTY array under `set -u` is
+    # an "unbound variable" error in bash < 4.4, and macOS ships /bin/bash 3.2 - which this file
+    # supports by design (see the header). THIS_OMVLL is empty for armeabi-v7a and x86_64, so a
+    # Mac died with `THIS_OMVLL[@]: unbound variable` on the SECOND ABI, after arm64 had already
+    # built and printed its size. Linux/bash 5 cannot reproduce it, so the lint in
+    # tests/test_obfuscate.py is what keeps this from coming back.
+    # The `-n "$OMVLL_PLUGIN"` test replaced `${#OMVLL_FLAGS[@]} -gt 0` for the same reason: no
+    # expansion of a possibly-empty array, not even for its length.
     THIS_OMVLL=()
-    if [[ ${#OMVLL_FLAGS[@]} -gt 0 && "$ABI" == "arm64-v8a" ]]; then
-        THIS_OMVLL=("${OMVLL_FLAGS[@]}")
+    if [[ -n "${OMVLL_PLUGIN:-}" && "$ABI" == "arm64-v8a" ]]; then
+        THIS_OMVLL=(${OMVLL_FLAGS[@]+"${OMVLL_FLAGS[@]}"})
     fi
 
-    "$CLANG" --target="$TRIPLE" $EXTRA "${THIS_OMVLL[@]}" "${CFLAGS[@]}" "${LDFLAGS[@]}" \
-        -I"$HERE" "$HERE/stub.c" -o "$ELF"
+    "$CLANG" --target="$TRIPLE" $EXTRA ${THIS_OMVLL[@]+"${THIS_OMVLL[@]}"} \
+        "${CFLAGS[@]}" "${LDFLAGS[@]}" -I"$HERE" "$HERE/stub.c" -o "$ELF"
 
     # Hard requirement: no dynamic relocations and no undefined symbols, or the blob
     # is not self-contained and will crash when injected.
@@ -163,8 +265,10 @@ for PAIR in $TARGETS; do
         fi
     fi
 
-    ENTRY_OFF="$(sym_off "$ELF" sopk_entry)"
-    INFO_OFF="$(sym_off "$ELF" g_decinfo)"
+    # `|| true`: sym_off pipes readelf into awk, so a readelf failure would kill the script here
+    # through pipefail instead of reaching the "missing symbols" message one line down.
+    ENTRY_OFF="$(sym_off "$ELF" sopk_entry || true)"
+    INFO_OFF="$(sym_off "$ELF" g_decinfo || true)"
     [[ -n "$ENTRY_OFF" && -n "$INFO_OFF" ]] || { echo "ERROR: missing symbols in $ABI" >&2; exit 1; }
 
     "$OBJCOPY" -O binary "$ELF" "$BLOB"

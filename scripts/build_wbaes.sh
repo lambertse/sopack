@@ -158,6 +158,18 @@ if [ "$HOST_ONLY" -eq 0 ]; then
     [ -x "$CXX" ] || die "no clang++ at $CXX"
     [ -x "$READELF" ] || die "no llvm-readelf at $READELF"
 
+    # Hand the GATED NDK down to every child process, mirroring build_chacha20.sh - and for the
+    # same reason, which is Phase 2 here. Everything in THIS script resolves the toolchain from
+    # $NDK (--ndk wins), but stub/build_stubs.sh, sopack/obfuscate.py and tests/test_obfuscate.py
+    # read ANDROID_NDK_HOME / ANDROID_NDK_ROOT and nothing else. Unexported, a shell carrying a
+    # STALE ANDROID_NDK_HOME (Android Studio's ndk-bundle is the classic) sends Phase 2's
+    # polymorphic-stub test to a different clang than the one validated three lines up. The
+    # O-MVLL plugin is pinned to NDK r29, so an older clang rejects -fpass-plugin outright and
+    # the whole run dies inside a unit test whose message names neither NDK.
+    # ROOT as well as HOME: whichever of the two the caller had set must not out-rank $NDK.
+    export ANDROID_NDK_HOME="$NDK"
+    export ANDROID_NDK_ROOT="$NDK"
+
     # sopack fetches and supplies the plugin (scripts/fetch_omvll.sh) and picks the per-host
     # filename itself; WBC only consumes what it is handed. This gate is about the hosts
     # upstream publishes no plugin for at all: macOS (Mach-O dylib) and Linux/x86_64 (ELF .so)
@@ -647,8 +659,14 @@ fi
 
 link_provider() {   # link_provider <extra flags…>
     # shellcheck disable=SC2086
-    "${SOPK_OMVLL_ENV[@]}" "$CXX" --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 -g0 \
-        "${SOPK_OMVLL_CFLAGS[@]}" \
+    # `${arr[@]+…}`, not `"${arr[@]}"`: both arrays are EMPTY under --no-omvll, and expanding an
+    # empty array under `set -u` is an "unbound variable" error in bash < 4.4 - i.e. macOS's
+    # /bin/bash 3.2. With --omvll (the default) they are populated, which is why this never
+    # surfaced: the flag that exists for hosts without a working plugin was broken on the host
+    # most likely to need it.
+    ${SOPK_OMVLL_ENV[@]+"${SOPK_OMVLL_ENV[@]}"} "$CXX" --target="${ABI_TRIPLE}${API}" \
+        -fPIC -shared -O2 -g0 \
+        ${SOPK_OMVLL_CFLAGS[@]+"${SOPK_OMVLL_CFLAGS[@]}"} \
         -ffile-prefix-map="$WBC=." -ffile-prefix-map="$SOPACK=." \
         -fvisibility=hidden -Wl,--exclude-libs,ALL -Wl,--no-undefined \
         -Wl,-soname,"$PROV_SONAME" \
@@ -705,8 +723,10 @@ ok "provider: $(basename "$PROV") ($(wc -c <"$PROV" | tr -d ' ') bytes)"
 # the DT_NEEDED comes from the provider's DT_SONAME rather than being invented.
 link_skeleton() {   # link_skeleton <extra flags…>
     # shellcheck disable=SC2086
-    "${SOPK_OMVLL_ENV[@]}" "$NDKBIN/clang" --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 -g0 \
-        "${SOPK_OMVLL_CFLAGS[@]}" \
+    # Same bash 3.2 empty-array guard as link_provider above.
+    ${SOPK_OMVLL_ENV[@]+"${SOPK_OMVLL_ENV[@]}"} "$NDKBIN/clang" \
+        --target="${ABI_TRIPLE}${API}" -fPIC -shared -O2 -g0 \
+        ${SOPK_OMVLL_CFLAGS[@]+"${SOPK_OMVLL_CFLAGS[@]}"} \
         -ffile-prefix-map="$SOPACK=." \
         -fvisibility=hidden -Wl,--no-undefined \
         -Wl,--version-script="$HIDE_ALL_MAP" \

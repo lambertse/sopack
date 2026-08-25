@@ -352,7 +352,9 @@ done <<EOF
 $APKS
 EOF
 
-for APK in "${APK_LIST[@]}"; do
+# `${APK_LIST[@]+…}`: an empty array under `set -u` is an "unbound variable" error in bash < 4.4
+# (macOS /bin/bash 3.2), and this array is empty when the glob matched nothing.
+for APK in ${APK_LIST[@]+"${APK_LIST[@]}"}; do
     IDX=$((IDX + 1))
     BASE="$(basename "$APK")"
     SLUG="$(printf '%s' "$BASE" | sed 's/\.apk$//' | tr -cd 'A-Za-z0-9._-')"
