@@ -430,7 +430,9 @@ def test_a_batch_leaves_one_index_line_per_pack(tmp_path, monkeypatch):
     cfg = tmp_path / "c.yaml"
     cfg.write_text("cipher: chacha20\n")
     for i in range(4):
-        src = _apk(tmp_path / f"app{i}.apk", entries=())      # no libs -> nothing-encrypted
+        # No libs, so each pack is a pass-through at exit 0. What is under test here is that a
+        # BATCH leaves one record per run, which is independent of the outcome of each run.
+        src = _apk(tmp_path / f"app{i}.apk", entries=())
         cli.main(["pack", src, "-o", str(tmp_path / f"o{i}.apk"), "--config", str(cfg)])
 
     rows = [json.loads(l) for l in

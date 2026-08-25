@@ -45,7 +45,7 @@ def test_sample_round_trips_to_exactly_the_defaults():
 
 
 @pytest.mark.parametrize("key", [
-    "cipher", "abis", "libraries", "include", "exclude",
+    "cipher", "obfuscate", "allow-repack", "abis", "libraries", "include", "exclude",
     "signing", "sign", "verify", "min-sdk", "keystore", "path", "alias",
     "store-pass", "key-pass", "logging", "stub-log", "allow-helper-log",
     # the host troubleshooting log
@@ -74,6 +74,32 @@ def test_default_excludes_cover_the_patterns_enforced_in_code():
     shipped = Config.default().libraries.exclude
     assert set(ALWAYS_EXCLUDE_PATTERNS) <= set(shipped)
     assert "libflutter" in shipped        # policy-only: config is its ONLY home
+
+
+def test_signing_is_off_by_default():
+    """sopack signs with a GENERATED DEBUG keystore, so signing gives the output a new app
+    identity that cannot update-install over the original - and a pipeline holding its own
+    production key wants the packed, aligned zip and nothing else. Signing later is equivalent:
+    apksigner preserves the 16 KB alignment already applied.
+
+    `verify` stays on deliberately. It is gated on whether anything was signed, so it is a no-op
+    while `sign` is false and springs back for anyone who turns signing on; flipping it too
+    would silently disable the check for exactly those users.
+
+    Note apk.repackage()'s own `no_sign=False` is UNCHANGED - that is the library default, and
+    config.py owns the user-facing one.
+    """
+    assert Config.default().signing.sign is False
+    assert Config.default().signing.verify is True
+    assert loads("signing:\n  sign: true\n").signing.sign is True
+
+
+def test_repacking_is_refused_by_default():
+    """The refusal has its own exit code (11). The key only downgrades it to a warning, because
+    detection reads evidence out of arbitrary third-party binaries and an operator who knows
+    better than the detector needs a way through that is not "edit the packer"."""
+    assert Config.default().allow_repack is False
+    assert loads("allow-repack: true\n").allow_repack is True
 
 
 def test_config_owns_the_user_facing_cipher_default():
@@ -183,6 +209,7 @@ def test_duplicate_key_is_an_error():
     ("file:\n  enabled: true\n", "file"),                         # flattened to the top level
     ("max-files: 5\n", "max-files"),                              # flattened to the top level
     ("signing:\n  file:\n    enabled: true\n", "file"),           # right key, wrong section
+    ("signing:\n  allow-repack: true\n", "allow-repack"),         # top-level key, wrong section
 ])
 def test_unknown_or_misplaced_keys_are_an_error(text, bad):
     """A silently ignored `verify: false` is worse than a typo - the user believes they
@@ -193,6 +220,7 @@ def test_unknown_or_misplaced_keys_are_an_error(text, bad):
 
 @pytest.mark.parametrize("text", [
     "signing:\n  min_sdk: 24\n",
+    "allow_repack: true\n",
     "signing:\n  keystore:\n    store_pass: x\n",
     "logging:\n  stub_log: true\n",
     "logging:\n  file:\n    max_size_mb: 5\n",
@@ -401,6 +429,7 @@ def test_bad_cipher_is_an_error():
 
 
 @pytest.mark.parametrize("text", ["signing:\n  verify: 'true'\n",
+                                  "allow-repack: 1\n",
                                   "signing:\n  sign: 1\n",
                                   "logging:\n  stub-log: 'yes'\n"])
 def test_booleans_must_be_real_booleans(text):
@@ -494,7 +523,13 @@ def packed(tmp_path, monkeypatch):
     calls = {}
 
     class _Res:
+        # A hand-rolled stand-in rather than a real RepackResult, so it has to be kept in step
+        # with every field `_cmd_pack` reads off the result. These tests are about which kwargs
+        # reach repackage, so a field added for an unrelated reason shows up here as an
+        # AttributeError five tests wide.
         injected, untouched, failed, signed = [], [], [], False
+        passthrough = False
+        cross_abi_cleartext, helper_log_allowed = [], False
 
     def _fake_repackage(in_apk, out_apk, wanted_libs, **kw):
         calls.update(kw, wanted_libs=wanted_libs)
@@ -526,9 +561,16 @@ def test_defaults_reach_repackage_unchanged(packed):
     assert kw["abis"] == DEFAULT_ABIS
     assert kw["wanted_libs"] is None          # auto-select, not []
     assert kw["exclude_libs"] == list(Config.default().libraries.exclude)
-    assert kw["no_sign"] is False
+    # TRUE, because `signing.sign` defaults to FALSE and this is its inverse. A default pack
+    # therefore never invokes apksigner and never generates ~/.sopack/debug.keystore: sopack
+    # signs with a debug key, which gives the output an app identity that cannot update-install
+    # over the original, and a pipeline holding its own production key wants the packed,
+    # aligned zip and nothing else. Signing afterwards is equivalent - apksigner preserves the
+    # 16 KB alignment already applied.
+    assert kw["no_sign"] is True
     assert kw["log"] is False
     assert kw["allow_helper_log"] is False
+    assert kw["allow_repack"] is False
     assert kw["min_sdk"] is None
 
 

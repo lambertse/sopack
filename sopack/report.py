@@ -102,6 +102,15 @@ def build(cfg, res, *, input_apk, output_apk, exit_code, error, config_source,
         # None (not False) when we never got as far as signing, so a consumer can tell "left
         # unsigned" apart from "never reached that stage".
         "signed": getattr(res, "signed", None) if res is not None else None,
+        # True when the container had no native libraries and the input was copied through
+        # verbatim. Read it TOGETHER with `signed`, which now has three causes: a degraded or
+        # disabled signing step, an AAB (never signed), and this - where the output still
+        # carries the INPUT's own signature because nothing was rewritten. A batch consumer
+        # treating `signed == false` as "broken" flags all three otherwise.
+        #
+        # Added without bumping SCHEMA, for the same reason `container` was: a new key cannot
+        # break a reader that does not look for it, and no existing key changed meaning.
+        "passthrough": bool(getattr(res, "passthrough", False)),
         "encrypted": [
             {"entry": ir.entry,
              "abi": ir.abi,
@@ -165,6 +174,10 @@ def index_line(report: dict) -> dict:
         "cross_abi_cleartext_count": report.get("cross_abi_cleartext_count"),
         "not_selected_count": report.get("not_selected_count"),
         "signed": report.get("signed"),
+        # A bool, so it cannot trip the _MAX_LINE trimming below - and it is what separates a
+        # genuine zero-library pack from "this app has no native code" in a batch listing,
+        # both of which are exit 0.
+        "passthrough": report.get("passthrough"),
         "warning_count": len(report.get("warnings") or ()),
         "duration_ms": report.get("duration_ms"),
         "error": report.get("error"),

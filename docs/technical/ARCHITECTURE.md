@@ -332,7 +332,11 @@ path; §6a says what a bundle does instead.
    same run can never be fed back through Component 2.
    Under auto-select an `InjectError` on one library is demoted to a **skip** (the original
    entry is written back verbatim and reported); an explicitly named library still aborts
-   the pack. Zero packed libraries is always an error.
+   the pack. Zero packed libraries is an error (exit 6) **when there were libraries to pack**;
+   a container with no native-library entries at all is instead copied through verbatim at
+   exit 0, decided by a central-directory pre-scan before any of this runs. That pre-scan
+   also refuses a container carrying sopack's own artifacts (exit 11) - see
+   `sopack/detect.py`.
 2. Write the injected `.so` back **STORED (uncompressed)** so it stays page-mappable;
    drop the old `META-INF` signature.
 3. **16 KB-align**: `zipalign -P 16` if a runnable one is found, else a **built-in
@@ -1048,7 +1052,25 @@ sopack pack in.apk -o out.apk                                     apk.py:repacka
                       unconditionally, so an already-packed APK cannot feed
                       libsopk_* back through inject
            │
+  CENTRAL-DIRECTORY PRE-SCAN - one namelist() read, two questions, both settled
+  BEFORE the wbaes preflight below (which raises exit 7 and would otherwise mask them):
+    ├─ detect.scan_entries() finds our own artifacts ──▶ AlreadyPackedError (exit 11)
+    │     ← detect.py. The cheap tier: catches every wbaes re-pack with no
+    │       decompression at all. The per-library tier runs inside the loop.
+    │
+    └─ no entries match the lib pattern at all ──▶ copyfile(in, out), exit 0
+          Nothing sopack could ever have protected, so not an error - and NOT a
+          rezip either: verbatim, so the input's own signature survives. Scoped to
+          auto-select; an explicit libraries.include still fails with exit 5.
+           │
+  wbaes preflight: find_wb_keygen()      ← skipped entirely by the pass-through above
+           │
   FOR EACH ENTRY matching the container's lib pattern:
+    │
+    ├─ detect.scan_library() ──▶ AlreadyPackedError (exit 11) on definitive evidence;
+    │     scan_library_heuristic() only WARNS. Run over EVERY candidate, not just the
+    │     selected ones - libsopk_* is in ALWAYS_EXCLUDE_PATTERNS, so a
+    │     selection-scoped check would never look at the artifacts themselves.
     │
     ├─ _classify → candidate?   ← apk.py:_classify, via apk.py:_match_lib_pattern
     │                             (exclusion is checked BEFORE selection)
@@ -1097,6 +1119,8 @@ sopack pack in.apk -o out.apk                                     apk.py:repacka
        missing provider fails 100% of launches inside whatever dlopen'd the target.
            │
   zero packed libraries ──▶ NothingPackedError (exit 6), carrying the partial result
+           │                (only reachable when there WERE candidates - a container with
+           │                 none was passed through at exit 0 by the pre-scan above)
            │
   APK: 16 KB zip-align, then apksigner self-sign (best-effort; warns if absent)
   AAB: no align, NEVER signed - META-INF/*.{SF,RSA,MF} stripped, go run jarsigner

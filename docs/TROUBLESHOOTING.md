@@ -65,24 +65,35 @@ status is 8 bits, so it cannot carry both a class and a count (and a negative co
 
 | Code | Status | Meaning | Where to look |
 |-----:|--------|---------|---------------|
-| `0` | `ok` | at least one library encrypted | check `failed_count` - 0 can still mean libraries shipped in cleartext |
+| `0` | `ok` | at least one library encrypted, **or** the input had no native libraries at all and was copied through unchanged | check `failed_count` (0 can still mean libraries shipped in cleartext) and `passthrough` |
 | `1` | `internal-error` | unmodelled failure; treat as a sopack bug | the traceback in `runs/<id>/run.log` |
 | `2` | `usage-error` | bad command line, a removed flag, or `init-config` over an existing file | **stderr only - there is no run record**, because nothing was packed |
 | `3` | `config-error` | config missing, unparseable, or an unknown/misplaced key | the message names the key |
 | `4` | `input-error` | input missing, unreadable, not a zip, or a zip that is neither an APK nor an AAB | [§neither an APK nor an AAB](#error-file-is-a-zip-but-neither-an-apk-nor-an-android-app-bundle) |
 | `5` | `selection-error` | nothing matched `libraries.include` | [§no .so entries matched](#error-no-so-entries-matched-the-requested-list-nothing-to-encrypt) |
-| `6` | `nothing-encrypted` | the pack ran and protected zero libraries | [§none of the N entries were packed](#error-none-of-the-n-libso-entries-in-this-apk-were-packed) |
+| `6` | `nothing-encrypted` | native libraries were present and **none** got protected (excluded, outside `abis:`, or they failed to inject) | [§none of the N entries were packed](#error-none-of-the-n-libso-entries-in-this-apk-were-packed) |
 | `7` | `toolchain-error` | missing stub blob or helper skeleton, no `wb_keygen`, sealing failed | [§could not find a host wb_keygen](#error-could-not-find-a-host-wb_keygen-on-a-fresh-checkout) |
 | `8` | `inject-error` | injection, self-verify, or a 16 KB alignment refusal | [§16 KB](#so-is-not-16-kb-page-compatible-to-begin-with-arm64) |
-| `9` | `signing-error` | `apksigner` was found but failed | [§could not find apksigner](#could-not-find-apksigner-zipalign-keytool) |
+| `9` | `signing-error` | `apksigner` was found but failed. Only reachable with `signing.sign: true`, which is **not** the default | [§could not find apksigner](#could-not-find-apksigner-zipalign-keytool) |
 | `10` | `output-error` | could not write the output APK | |
+| `11` | `already-packed` | the input is a sopack **output**; re-packing was refused | [§this APK is already packed](#error-this-apk-is-already-packed-by-sopack) |
 
 Note `2` is reserved: `argparse` uses it for a malformed command line, so nothing else may take it.
-An **unsigned but successfully packed** APK is still `0` - signing is best-effort by design; detect
-it with `"signed": false` in the record rather than an exit code. Read that field together with
-`"container"`: a packed **AAB** is always `"signed": false`, because sopack never signs a bundle
-(see [§My packed AAB is unsigned](#my-packed-aab-is-unsigned)), so on its own the field does not
-distinguish "left unsigned by design" from "signing was skipped or unavailable".
+Codes are positive and 1-byte; **there are no negative codes**, because an exit status is 8 bits
+unsigned and `sys.exit(-1)` reaches the shell as `255`.
+
+An **unsigned but successfully packed** APK is `0`, and since `signing.sign` defaults to `false`
+that is now the normal outcome - detect it with `"signed": false` in the record rather than an exit
+code. That field has **three** causes and only the first two are things to act on:
+
+| `"signed": false` because | how to tell | what it means |
+|---|---|---|
+| signing was disabled or unavailable | `passthrough: false`, `container: "apk"` | the APK is packed but not installable until you sign it |
+| the output is an **AAB** | `container: "aab"` | by design - sopack never signs a bundle (see [§My packed AAB is unsigned](#my-packed-aab-is-unsigned)) |
+| nothing was rewritten | `passthrough: true` | the input had no native libraries, so it was copied through and **still carries its original signature** |
+
+A batch filter looking for broken packs therefore wants `signed == false and passthrough == false
+and container == "apk"`, not `signed == false` alone.
 
 ## The on-device diagnostic
 
@@ -382,8 +393,10 @@ packed` - the wording names the container it actually saw.)
 Auto-select found libraries but every one was excluded or failed to inject. The per-library
 reasons are printed above the error.
 
-- `excluded by 'libsopk_*'` on **every** entry means you are re-packing an already-packed
-  APK. Pack the original.
+- `excluded by 'libsopk_*'` on **every** entry used to be how a re-pack surfaced. It should no
+  longer reach here at all: an already-packed container is refused up front with exit **11**
+  (see [§this APK is already packed](#error-this-apk-is-already-packed-by-sopack)). If you see
+  this, the artifacts were renamed - pack the original.
 - `abi not selected` on every entry means the APK ships no `arm64-v8a` libraries; use
   `abis: all` or name the ABI it does ship.
 - `excluded by '...'` from your own `libraries.exclude` - loosen the glob. Note it also
@@ -559,9 +572,44 @@ provider* pair is caught too.
 
 ## Pack fails: `libsopk_wb.so already exists in this APK`
 
-You are packing an already-packed APK. Reusing the existing provider would leave every thin
-helper resolving against a **foreign** sealed blob, so no session key would unwrap and every
-target would abort. Pack the original APK instead.
+You are packing an already-packed APK, and you got past the exit-11 gate below - which means
+`allow-repack: true` is set. Reusing the existing provider would leave every thin helper
+resolving against a **foreign** sealed blob, so no session key would unwrap and every target
+would abort. Pack the original APK instead.
+
+## `error: this APK is already packed by sopack`
+
+Exit code **11** (`already-packed`). The input is one of sopack's own outputs. Pack the
+**original** container.
+
+Re-packing is not merely redundant, it is destructive. Under `cipher: wbaes` the second pack
+seals a *new* long-term key, and the `libsopk_wb.so` already inside can neither be reused (its
+blob will not unwrap the new helpers' session keys) nor replaced (the *old* helpers unwrap
+against it) - so the app would abort on essentially every launch. Under the stub ciphers,
+already-encrypted `.text` is simply encrypted a second time.
+
+Detection is two-tiered, and the message names which tier fired:
+
+| evidence | tier | effect |
+|---|---|---|
+| a `lib/<abi>/libsopk_wb.so` or `lib/<abi>/libsopk_rt_*.so` entry | definitive | refuse |
+| a sopack build marker inside a library (including superseded ones) | definitive | refuse |
+| a target that `DT_NEEDED`s `libsopk_rt_*` | definitive | refuse |
+| a stub segment whose metadata de-whitens to the decinfo magic | definitive | refuse |
+| `DT_INIT` into an R+X segment no section covers | heuristic | **warn only** |
+
+The last row is deliberately not fatal: other packers emit the same segment shape, so refusing
+on it would break a legitimate pack. It is also all that is left for an `obfuscate: true` pack,
+whose stub differs in every app.
+
+If you are certain the input is not a sopack output - or you genuinely intend a re-pack - set:
+
+```yaml
+allow-repack: true
+```
+
+That downgrades the refusal to a warning. It does not make re-packing work; it only stops
+sopack from stopping you.
 
 ## A packed library never logs `- OK`, but the app runs
 

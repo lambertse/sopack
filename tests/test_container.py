@@ -81,8 +81,13 @@ def test_an_apks_nested_library_is_not_even_a_candidate(tmp_path):
     """
     src = mkapk(tmp_path / "in.apk", ["assets/lib/arm64-v8a/nested.so",
                                       "extras/lib/arm64-v8a/nested.so"])
-    with pytest.raises(RuntimeError, match="no lib/<abi>/\\*\\.so entries at all"):
-        apk.repackage(src, str(tmp_path / "out.apk"), None, logger=lambda *_: None)
+    # Zero candidates, so this is now a pass-through at exit 0 rather than an error - and
+    # `passthrough` asserts exactly the property this test is about: neither nested entry was
+    # seen as a native library. A union regex `^(?:([^/]+)/)?lib/...` would select both, and
+    # this would fail with two injections instead.
+    res = apk.repackage(src, str(tmp_path / "out.apk"), None, logger=lambda *_: None)
+    assert res.passthrough is True
+    assert res.injected == []
 
 
 def test_a_bundle_requires_the_module_segment(tmp_path):
@@ -92,8 +97,9 @@ def test_a_bundle_requires_the_module_segment(tmp_path):
     src = mkaab(tmp_path / "in.aab")
     with zipfile.ZipFile(src, "a") as z:
         z.writestr("lib/arm64-v8a/libstray.so", b"\x7fELF-not-really")
-    with pytest.raises(RuntimeError, match="no <module>/lib/<abi>/\\*\\.so entries at all"):
-        apk.repackage(src, str(tmp_path / "out.aab"), None, logger=lambda *_: None)
+    res = apk.repackage(src, str(tmp_path / "out.aab"), None, logger=lambda *_: None)
+    assert res.passthrough is True, "a bundle's root-level lib/<abi>/ must not be a candidate"
+    assert res.injected == []
 
 
 def test_error_wording_names_the_container_it_saw(tmp_path):

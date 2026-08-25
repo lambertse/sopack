@@ -33,9 +33,9 @@ from .cipher import CIPHER_IDS, CIPHER_WBAES, WHITEN_SPAN, apply_cipher, gen_key
 from .metadata import (DecInfo, FLAG_CHAIN_INIT, FLAG_LOG, FLAG_NEED_ICACHE,
                        MAGIC, SIZE as DECINFO_SIZE, VERSION)
 from .provision import PackKey, provision_pack, provision_text
-from .rt_meta import (HELPER_BUILD_MARKER, PROVIDER_ABI, PROVIDER_BUILD_MARKER,
-                      PROVIDER_ENTRY, PROVIDER_SONAME, REGION_MAGIC, REGION_VERSION,
-                      WB_REGION_MAGIC, WRAPPED_KEY_BYTES, TargetRegion, WbRegion)
+from .rt_meta import (HELPER_BUILD_MARKER, HELPER_SONAME_PREFIX, PROVIDER_ABI,
+                      PROVIDER_BUILD_MARKER, PROVIDER_ENTRY, PROVIDER_SONAME, REGION_MAGIC,
+                      REGION_VERSION, WB_REGION_MAGIC, WRAPPED_KEY_BYTES, TargetRegion, WbRegion)
 from .stubs import Stub, helper_skeleton_path, load_stub, provider_skeleton_path
 
 # Bionic-provided libraries an injected helper may depend on WITHOUT bundling anything
@@ -193,7 +193,22 @@ class _LoaderView:
 
     def __init__(self, path: str):
         with open(path, "rb") as f:
-            self.buf = buf = f.read()
+            self._parse(f.read())
+
+    @classmethod
+    def from_bytes(cls, buf: bytes) -> "_LoaderView":
+        """Same view, over bytes already in memory.
+
+        `detect.py` scans every candidate library from the `zin.read(name)` the repackage loop
+        already performs, so writing each one to a temp file only to read it straight back would
+        be the whole cost of the scan.
+        """
+        self = cls.__new__(cls)
+        self._parse(buf)
+        return self
+
+    def _parse(self, buf: bytes) -> None:
+        self.buf = buf
         self.is64 = is64 = buf[4] == 2
         self.W = W = "<Q" if is64 else "<I"
         e_phoff = struct.unpack_from(W, buf, 0x20 if is64 else 0x1C)[0]
@@ -201,7 +216,13 @@ class _LoaderView:
         e_phnum = struct.unpack_from("<H", buf, 0x38 if is64 else 0x2C)[0]
         p_offset, p_vaddr = (8, 16) if is64 else (4, 8)
         p_filesz, p_memsz = (32, 40) if is64 else (16, 20)
+        # p_flags sits in a DIFFERENT slot per class: right after p_type on ELF64, but after
+        # p_align at the very end of the entry on ELF32. Getting this wrong reads p_offset.
+        p_flags = 4 if is64 else 24
         self.loads, dyn = [], None
+        # Parallel to `self.loads`, deliberately NOT a fifth tuple element: `vaddr_to_off`
+        # unpacks those as 4-tuples, and widening them would break it silently at every call.
+        self.load_flags: list[int] = []
         for i in range(e_phnum):
             p = e_phoff + i * e_phentsize
             ptype = struct.unpack_from("<I", buf, p)[0]
@@ -210,6 +231,7 @@ class _LoaderView:
                                    struct.unpack_from(W, buf, p + p_offset)[0],
                                    struct.unpack_from(W, buf, p + p_filesz)[0],
                                    struct.unpack_from(W, buf, p + p_memsz)[0]))
+                self.load_flags.append(struct.unpack_from("<I", buf, p + p_flags)[0])
             elif ptype == _PT_DYNAMIC:
                 dyn = (struct.unpack_from(W, buf, p + p_offset)[0],
                        struct.unpack_from(W, buf, p + p_filesz)[0])
@@ -526,7 +548,7 @@ def _helper_soname_for(target_soname: str) -> str:
     """Per-target helper soname. Keep it deterministic and collision-free."""
     base = target_soname[:-3] if target_soname.endswith(".so") else target_soname
     safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in base)
-    return f"libsopk_rt_{safe}.so"
+    return f"{HELPER_SONAME_PREFIX}{safe}.so"
 
 
 # The two hand-built wbaes artifacts. Guards differ per kind, so every check below says which

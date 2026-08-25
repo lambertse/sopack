@@ -95,6 +95,17 @@ cipher: wbaes
 # packs. The seed used is recorded in report.json.
 obfuscate: false
 
+# Pack a container that sopack has ALREADY packed. Off by default, and the refusal
+# has its own exit code (11). Re-packing is destructive in wbaes mode - the second
+# pack seals a new white-box key that the helpers already inside cannot unwrap - and
+# in the stub modes it encrypts ciphertext a second time.
+#
+# Detection is two-tiered. sopack's own added entries (libsopk_wb.so, libsopk_rt_*)
+# and the markers inside them REFUSE the pack; a library that merely has the SHAPE of
+# a packed one (some other vendor's packer looks similar) only warns. This key
+# downgrades the refusal to a warning as well.
+allow-repack: false
+
 # A list, or the string "all" for every supported ABI
 # (arm64-v8a, armeabi-v7a, x86_64). arm64-v8a is the only ABI protected in
 # practice; the others ship their .text in cleartext.
@@ -145,8 +156,13 @@ libraries:
 # cannot read one, and the signature Play checks is your upload key). A packed AAB
 # is always handed back UNSIGNED, for you to sign with jarsigner.
 signing:
-  sign: true            # false == the old --no-sign: leave the APK UNSIGNED
-  verify: true          # print the signer certificates after signing
+  # OFF by default: sopack signs with a GENERATED DEBUG keystore, which gives the
+  # output a new app identity that cannot update-install over the original. The
+  # default output is therefore a packed, 16 KB-aligned, UNSIGNED APK - sign it with
+  # your own key, which apksigner can do afterwards without disturbing the alignment.
+  # Set this to true to have sopack self-sign with the keystore below.
+  sign: false
+  verify: true          # print the signer certificates after signing (only when sign: true)
   min-sdk:              # override apksigner minSdkVersion if manifest detection fails
 
   keystore:
@@ -201,7 +217,16 @@ class KeystoreConfig:
 
 @dataclass(frozen=True)
 class SigningConfig:
-    sign: bool = True
+    # OFF by default. sopack's keystore is a generated debug one, so signing with it gives the
+    # output a NEW app identity that cannot update-install over the original - and the packed,
+    # aligned zip is what a pipeline with its own production key actually wants. Signing later
+    # is equivalent: apksigner preserves the 16 KB alignment `_align_apk` already applied.
+    #
+    # Turning this on is still fully supported and is the only way to reach exit 9.
+    sign: bool = False
+    # Left ON. It is gated on `res.signed`, so it is a no-op while `sign` is false and springs
+    # back for anyone who turns signing on - flipping it too would silently disable the check
+    # for them.
     verify: bool = True
     min_sdk: int | None = None
     keystore: KeystoreConfig = field(default_factory=KeystoreConfig)
@@ -263,6 +288,12 @@ class Config:
     # the same stub. Stub ciphers only. Off by default because it needs the NDK + the O-MVLL
     # plugin AT PACK TIME, which breaks the prebuilt-blob model and slows packs.
     obfuscate: bool = False
+    # Pack a container that sopack has already packed. Off by default: re-packing is
+    # destructive in wbaes mode (the second pack seals a key the helpers already inside cannot
+    # unwrap) and uncharacterised in the stub modes, and until this existed the tool did it
+    # silently. See sopack/detect.py for what counts as evidence and why only the definitive
+    # tier refuses.
+    allow_repack: bool = False
     abis: tuple[str, ...] = DEFAULT_ABIS
     libraries: LibraryConfig = field(default_factory=LibraryConfig)
     signing: SigningConfig = field(default_factory=SigningConfig)
@@ -274,7 +305,8 @@ class Config:
 
 
 # ---- validation helpers ------------------------------------------------------------
-_TOP_KEYS = frozenset({"cipher", "obfuscate", "abis", "libraries", "signing", "logging"})
+_TOP_KEYS = frozenset({"cipher", "obfuscate", "allow-repack", "abis", "libraries", "signing",
+                       "logging"})
 _LIB_KEYS = frozenset({"include", "exclude"})
 _SIGN_KEYS = frozenset({"sign", "verify", "min-sdk", "keystore"})
 _KS_KEYS = frozenset({"path", "alias", "store-pass", "key-pass"})
@@ -588,6 +620,7 @@ def _build(data: dict) -> Config:
     return Config(
         cipher=cipher,
         obfuscate=obfuscate,
+        allow_repack=_as_bool(data.get("allow-repack"), "allow-repack", d.allow_repack),
         abis=_build_abis(data.get("abis"), d.abis),
         libraries=_build_libraries(data.get("libraries")),
         signing=_build_signing(data.get("signing")),

@@ -5,6 +5,7 @@ that do live in test_integration.py / test_wbaes.py.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import zipfile
 
@@ -201,27 +202,73 @@ def test_init_config_refuses_to_clobber(tmp_path, monkeypatch):
     assert (tmp_path / "config.yaml").read_text() == "cipher: xor\n"
 
 
-# ---- 7. zero-library errors -------------------------------------------------------
+# ---- 7. zero libraries: a pass-through under auto-select, an error when named ------
 
 
-def test_no_libs_at_all(tmp_path):
+def test_no_libs_at_all_passes_the_input_through(tmp_path):
+    """Not an error, and the output is the input byte-for-byte.
+
+    sopack could never have protected anything here - there is no native code - so there is
+    nothing to diagnose, and a pipeline that packs every build must not die on a
+    pure-Java/Kotlin APK. Contrast `test_everything_excluded_or_out_of_abi` below, which stays
+    a failure precisely because libraries WERE present and shipped in cleartext.
+
+    The copy is verbatim rather than a rezip, so the input's own signature survives - which is
+    why `signed` is False here without meaning "you must sign this before installing".
+    """
     src = _mkapk(tmp_path / "in.apk", [])
     out = str(tmp_path / "out.apk")
-    with pytest.raises(RuntimeError, match="no lib/<abi>/\\*\\.so entries at all"):
-        apk.repackage(src, out, None, logger=lambda *_: None)
+    res = apk.repackage(src, out, None, logger=lambda *_: None)
+    assert res.passthrough is True
+    assert res.injected == []
+    assert res.signed is False
+    assert open(out, "rb").read() == open(src, "rb").read()
+
+
+def test_a_named_library_that_is_absent_is_still_an_error(tmp_path):
+    """The asymmetry that scopes the pass-through above to auto-select. The user who wrote
+    `libraries.include` vouched for those names; packing nothing and reporting success would
+    hide a typo'd or stale library list."""
+    src = _mkapk(tmp_path / "in.apk", [])
+    out = str(tmp_path / "out.apk")
     with pytest.raises(RuntimeError, match="no .so entries matched the requested list"):
         apk.repackage(src, out, ["libfoo.so"], logger=lambda *_: None)
+    assert not os.path.exists(out), "nothing should have been written"
 
 
 def test_everything_excluded_or_out_of_abi(tmp_path):
+    """Libraries WERE present and none got packed - still an error, unlike the empty container
+    above. Something shipped in cleartext that the operator may have expected to be encrypted.
+
+    `libvosWrapperEx`, not `libsopk_wb`, stands in for the unconditionally-excluded half: an APK
+    containing sopack's own artifacts is now refused earlier and for a different reason (see the
+    test below), so using one here would never reach this message.
+    """
     src = _mkapk(tmp_path / "in.apk", [
-        "lib/arm64-v8a/libflutter.so",      # excluded by the caller's list
-        "lib/arm64-v8a/libsopk_wb.so",      # excluded unconditionally, list or no list
-        "lib/x86_64/libapp.so",             # outside the default abis
+        "lib/arm64-v8a/libflutter.so",         # excluded by the caller's list
+        "lib/arm64-v8a/libvosWrapperEx.so",    # excluded unconditionally, list or no list
+        "lib/x86_64/libapp.so",                # outside the default abis
     ])
     with pytest.raises(RuntimeError, match="none of the 3 lib/<abi>/"):
         apk.repackage(src, str(tmp_path / "out.apk"), None,
                       exclude_libs=["libflutter"], logger=lambda *_: None)
+
+
+def test_an_apk_carrying_our_own_artifacts_is_refused_before_selection(tmp_path):
+    """The case the test above used to cover with `libsopk_wb.so`, and why it had to move.
+
+    `libsopk_*` being in ALWAYS_EXCLUDE_PATTERNS meant a re-pack surfaced only as "every entry
+    was excluded" - exit 6, with the real cause buried in the per-library reasons. It is now its
+    own refusal (exit 11) raised from the central-directory pre-scan, before `_classify` runs at
+    all. The exclusion stays as defence in depth.
+    """
+    from sopack.errors import AlreadyPackedError
+    src = _mkapk(tmp_path / "in.apk", [
+        "lib/arm64-v8a/libapp.so",
+        "lib/arm64-v8a/libsopk_wb.so",
+    ])
+    with pytest.raises(AlreadyPackedError, match="already packed"):
+        apk.repackage(src, str(tmp_path / "out.apk"), None, logger=lambda *_: None)
 
 
 # ---- 8. fail-soft under auto-select, hard fail when named -------------------------

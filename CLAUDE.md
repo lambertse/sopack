@@ -127,6 +127,14 @@ sopack init-config [-o PATH]                # write a commented config.yaml ('-'
 # unedited config packs exactly like no config.
 #
 # The schema, and what each key replaced:
+#   allow-repack: false               pack a container sopack has ALREADY packed. Off by default;
+#                                     the refusal is its own exit code (11, AlreadyPackedError).
+#                                     Re-packing is DESTRUCTIVE under wbaes (the second pack seals
+#                                     a key the helpers already inside cannot unwrap, so the app
+#                                     aborts on essentially every launch) and uncharacterised under
+#                                     the stub ciphers, which used to double-encrypt in silence.
+#                                     See "Already-packed detection" below for the two tiers; this
+#                                     key downgrades the definitive tier to a warning too.
 #   obfuscate: false                  recompile a freshly-seeded, O-MVLL-obfuscated stub for
 #                                     EVERY pack, so no two apps ship the same one. STUB CIPHERS
 #                                     ONLY - `obfuscate: true` with `cipher: wbaes` is an ERROR,
@@ -175,8 +183,21 @@ sopack init-config [-o PATH]                # write a commented config.yaml ('-'
 #                                     config is a no-op; libflutter lives only here.
 #                                     `libraries.default-excludes` was REMOVED - config.py
 #                                     gives it a targeted message via _REMOVED_KEYS.
-#   signing.sign: true                false == the old --no-sign.
+#   signing.sign: false               DEFAULTS OFF (this changed - it used to be true). sopack
+#                                     signs with a GENERATED DEBUG keystore, so signing gives the
+#                                     output a new app identity that cannot update-install over
+#                                     the original; the default artifact is a packed, 16 KB-aligned,
+#                                     UNSIGNED APK for the operator to sign with their own key.
+#                                     Signing later is EQUIVALENT - apksigner preserves alignment.
+#                                     Consequences: `~/.sopack/debug.keystore` is no longer
+#                                     generated on a default pack, apksigner is never invoked, and
+#                                     exit 9 (SIGNING) is unreachable without `sign: true`.
+#                                     `apk.repackage`'s own `no_sign=False` is UNCHANGED - library
+#                                     API, and config.py owns the user-facing default.
 #   signing.verify: true              DEFAULTS ON; false skips the post-signing apksigner dump.
+#                                     Left on despite `sign` flipping: it is gated on whether
+#                                     anything was signed, so it is a no-op while signing is off
+#                                     and springs back for anyone who turns signing on.
 #   signing.min-sdk:                  apksigner minSdkVersion override.
 #   signing.keystore.{path,alias,store-pass,key-pass}
 #                                     path null -> apk.DEFAULT_KEYSTORE_PATH
@@ -210,7 +231,9 @@ sopack init-config [-o PATH]                # write a commented config.yaml ('-'
 # silently keeps the last). Removed flags get a targeted message naming their config key
 # (cli._REMOVED_FLAGS) rather than argparse's bare "unrecognized arguments".
 #
-# SIGNING IS BEST-EFFORT. With no apksigner reachable, sopack WARNS and leaves the output
+# SIGNING IS OFF BY DEFAULT (`signing.sign: false`), so the normal artifact is a packed,
+# 16 KB-aligned, UNSIGNED APK and the CLI's closing line says so. When it IS turned on, signing is
+# BEST-EFFORT. With no apksigner reachable, sopack WARNS and leaves the output
 # unsigned rather than aborting - the pack itself is done by then, and a pipeline that signs with
 # its own production key later still wants the artifact. `signing.sign: false` makes that explicit
 # (and skips generating ~/.sopack/debug.keystore). apksigner is resolved BEFORE the keystore for
@@ -243,6 +266,9 @@ python -m pytest tests/test_rt_meta.py      # both region layouts vs stub/sopk_r
 python -m pytest tests/test_provision.py    # the blob-header gate: v>=4 + light KDF tier
 python -m pytest tests/test_config.py       # the YAML config: sample, defaults, every rejection
 python -m pytest tests/test_lib_select.py   # auto-select, exclusions, the CLI surface, fail-soft
+python -m pytest tests/test_detect.py       # already-packed detection: both tiers, the false
+                                           #   positives that matter more than the true ones, and
+                                           #   the de-whitening oracle against a real injection
 python -m pytest tests/test_container.py    # APK-vs-AAB detection, the two entry patterns, where
                                            #   a bundle's helpers land, and "never sign an AAB"
 python -m pytest tests/test_wbaes.py        # wbaes guards, the strip, and real injection
@@ -338,7 +364,8 @@ offline. It exists because a bundle that installs on Linux must be generated on 
 
 ## Architecture (the parts that span files)
 
-Three components + a thin CLI (`sopack/cli.py`) + the config layer (`sopack/config.py`, which
+Three components + a thin CLI (`sopack/cli.py`) + the config layer + `sopack/detect.py`, the
+already-packed gate that runs before any of them (`sopack/config.py`, which
 owns every user-facing default; `apk.repackage`'s own signature defaults are library API and are
 left alone, so the long-standing `wbaes`/`chacha20` skew between the two is simply unreachable):
 
@@ -414,6 +441,58 @@ Only five things differ, all read off the frozen `Container` descriptor, which i
   AAB otherwise. Added without bumping `SCHEMA` - an added key cannot break a reader that does not
   look for it, and no existing key changed meaning.
 
+### Already-packed detection (`sopack/detect.py`)
+
+Re-packing sopack's own output used to happen. Under `wbaes` it hit `apk.py`'s
+provider-collision guard and reported exit **1, "internal error"** - blaming the packer for a
+bad input - and under `chacha20`/`xor` nothing detected it at all, so ciphertext was encrypted a
+second time in silence. `detect.py` recognises the input and `repackage` refuses it
+(`AlreadyPackedError`, exit 11) unless `allow-repack: true`.
+
+**Two tiers, and only one of them aborts.** The split is the whole design: a false positive here
+refuses to pack a legitimate app, and the only way out is a config key the operator has to
+discover first.
+
+*Definitive* (nothing but sopack produces these) - **refuse**:
+
+| signal | catches | where |
+|---|---|---|
+| a `lib/<abi>/libsopk_wb.so` or `lib/<abi>/libsopk_rt_*.so` entry | every `wbaes` pack | `scan_entries`, central directory only |
+| `HELPER_BUILD_MARKER` / `PROVIDER_BUILD_MARKER` / **`SUPERSEDED_BUILD_MARKERS`** | our artifacts even if renamed, **including older sopack versions** | `scan_library`, byte scan |
+| a target that `DT_NEEDED`s `libsopk_rt_*` | a `wbaes` target with every helper deleted or renamed | `scan_library`, via `_LoaderView.needed()` |
+| `SRTT`/`SRTW` at the exact start of a `PT_LOAD` | a helper/provider built from a marker we do not know | `scan_library` |
+| the **de-whitening oracle** | a stock `chacha20`/`xor` pack | `scan_library` |
+
+*Heuristic* (other packers emit it too) - **warn only**: `DT_INIT` resolving into an `R+X`
+`PT_LOAD` that no section header covers.
+
+- **The de-whitening oracle is what stops this being wbaes-only.** Every other definitive signal
+  is a `wbaes` signal. For a stock stub the whitening key is a *precomputable per-ABI constant*
+  (the span is stub bytes `_self_verify` asserts come through byte-identical), so the 128-byte
+  record is simply un-masked and tested for `MAGIC + u32(2)`. A false positive needs 128 bytes
+  that de-whiten to that exact needle. Reading the de-whitened `cipher_id` is also the ONLY way
+  to tell an `xor` pack from a `chacha20` one from outside - they ship the identical blob,
+  segment and strings. It does **not** cover `obfuscate: true` (per-pack stub, so the key is
+  unknowable) or a pack made against a stub blob no longer in `sopack/stubs/`; both fall through
+  to the heuristic tier.
+- **`expand 32-byte k` and `/proc/self/auxv` are NOT signals at any tier**, though the stub does
+  ship both. Any library containing a ChaCha20 implementation has the first. **ZIP timestamps are
+  not a signal either** - `apk.py` deliberately stamps added entries with the target's own
+  `date_time` so they do not read as post-processed, and keying on the thing another part of the
+  tool works to erase would make the two fight.
+- **Enforced in `repackage`, not the CLI.** `repackage` is library API; a check living only in
+  `_cmd_pack` is bypassed by every direct caller. Threaded as `allow_repack`, like
+  `exclude_libs`/`no_sign`.
+- **Two enforcement points.** The central-directory tier runs in the pre-scan, before any
+  decompression. The per-library tier runs inside the entry loop over **every** candidate, not
+  just the selected ones - `libsopk_*` is in `ALWAYS_EXCLUDE_PATTERNS`, so a selection-scoped
+  check would never look at the artifacts themselves. It costs nothing extra: `data = zin.read(name)`
+  already runs for every entry.
+- The `apk.py` provider-collision `RuntimeError` **stays** as defence in depth. The new gate makes
+  it unreachable in practice, which is the point.
+- `scan_library` **never raises**. It is handed every ZIP member that merely ends in `.so`, and a
+  detector that dies on a truncated or non-ELF file turns a cosmetic oddity into a failed pack.
+
 ### Library selection (`apk.py:_classify` / `build_excludes`)
 
 `repackage(..., wanted_libs)` takes `None` to mean **auto-select every native library the
@@ -450,6 +529,9 @@ the same one).
   `DT_INIT-inplace` are the only strategies `master` emits). `DEFAULT_EXCLUDE_PATTERNS` in
   `apk.py` and the `default-excludes` toggle are **gone**; `repackage()` no longer knows about
   libflutter at all, so a direct library call must pass it in `exclude_libs`.
+- **A container with NO native libraries is a pass-through, not an error.** Handled by the
+  pre-scan in `repackage` before the entry loop (and before the wbaes preflight - see the
+  invariant below), so it never reaches `_classify`. Auto-select only.
 - **Fail-soft is scoped to auto-select.** An `InjectError` is demoted to a skip (original entry
   written back verbatim, recorded in `RepackResult.failed`) *only* when `wanted_libs is None`; an
   explicitly named library re-raises, prefixed with the APK entry name. The rationale is
@@ -457,6 +539,9 @@ the same one).
   libraries they never considered, and one stripped prebuilt must not kill the run. Zero packed
   libraries is always an error. Every cleartext library must appear in the CLI summary
   (`cli._print_summary`); silent skipping is worse than aborting.
+- **"Zero packed libraries is always an error" is no longer true and the qualifier is
+  load-bearing.** It is an error when there were libraries to pack. A container with none is
+  exit 0 (above).
 - **The wbaes provider loop is keyed on `thin_by_slot`, not `pack_keys`.** The white-box key is
   sealed lazily *before* `inject_so`, so an ABI whose every target was skipped has a `pack_keys`
   entry and no consumer - emitting its provider would add ~936 KB of dead white-box to the APK.
@@ -631,7 +716,9 @@ other tools and its output used to be human-only.
 - **`sopack/exitcodes.py`** - the code constants + status slugs, one source of truth.
 - **`sopack/report.py`** - `RepackResult` + `Config` → `report.json` and the `index.jsonl` line.
 - **`sopack/errors.py`** - `ToolMissingError` and `InputError`, both `FileNotFoundError`
-  subclasses. It imports nothing from sopack, so any layer can use it without a cycle.
+  subclasses, plus `AlreadyPackedError` (a `RuntimeError`, unrelated to that split - it lives
+  here so `detect.py` can raise it without importing the packer). It imports nothing from
+  sopack, so any layer can use it without a cycle.
 
 **All output already funnelled through three seams, so nothing was scattered:** `cli.py`'s ~24
 prints, the `logger=print` keyword `apk.repackage` already accepted (`apk.py:223`, 11 call sites -
@@ -664,7 +751,8 @@ record, which is the exact failure per-run records exist to prevent.
 
 **Exit code = status class ONLY; the count lives in the record.** `0` ok, `1` internal, `2` usage,
 `3` config, `4` input, `5` selection, `6` nothing-encrypted, `7` toolchain, `8` inject, `9` signing,
-`10` output. Three properties are deliberate and were the reason the originally-proposed encoding
+`10` output, `11` already-packed. Three properties are deliberate and were the reason the
+originally-proposed encoding
 (negative codes for errors, `>0` = number encrypted, `0` = nothing encrypted) was not used:
 
 - **An exit status is 8 bits unsigned.** `sopack.cli:main` is wrapped by setuptools as
@@ -673,9 +761,20 @@ record, which is the exact failure per-run records exist to prevent.
   subprocess, because an in-process `main() == N` assertion cannot detect truncation.
 - **One byte cannot carry a class and a count** - `exit 3` would mean both "config error" and "3
   libraries encrypted".
-- **`0` must keep meaning success**, or the case most worth flagging (nothing protected) becomes
-  the one `set -e` and every CI runner reads as fine. It is code `6` instead, and it stays a
-  failure, matching the pre-existing invariant at `apk.py:397-409`.
+- **`0` must keep meaning success**, or the case most worth flagging becomes the one `set -e` and
+  every CI runner reads as fine. The line is drawn at **whether there was anything to protect**,
+  not at whether anything was protected:
+  - native libraries present and **none** protected (excluded, wrong ABI, failed to inject) is
+    code `6` and stays a failure - something shipped in cleartext that the operator expected to
+    be encrypted.
+  - **no native libraries at all** is exit `0`. sopack could never have protected anything, so
+    there is no misconfiguration to report, and failing here breaks every pipeline that packs
+    each build unconditionally. The input is copied through **verbatim** (not rezipped - the
+    original signature survives) and `RepackResult.passthrough` / `report.json`'s `passthrough`
+    plus a `note_warning` keep it findable in a batch. Decided by a central-directory pre-scan
+    in `repackage`, which is why the `candidates == 0` branch at the old `apk.py:397-409` is now
+    unreachable under auto-select. Scoped to auto-select deliberately: an explicit
+    `libraries.include` that matches nothing is still `5`.
 
 **`2` is reserved for a malformed command line and nothing else may take it** - argparse exits 2 on
 its own, so sharing it would make "you typed the command wrong" indistinguishable. The two
@@ -758,6 +857,21 @@ would make precedence depend silently on insertion order.
   temp copy and cannot know the APK entry name, so the run report could not say *which* library it
   encrypted until `apk.py` stamped it (`ir.entry = name`). `failed`/`untouched` were already keyed
   on the entry, so this is also what makes the three lists line up.
+
+- **The pre-scan must stay ABOVE the `wbaes` preflight in `repackage`.** `find_wb_keygen` raises
+  `ToolMissingError` -> exit 7. Move the no-native-libraries pass-through below it and a lib-free
+  APK hard-fails with a toolchain error on any host that cannot resolve a host `wb_keygen` - a
+  chacha20-only portable bundle, say - for a reason that has nothing to do with the input and
+  with nothing to seal. The `obfuscate` + `wbaes` `ValueError` stays *above* the pre-scan: that
+  is a config contradiction and must raise regardless of what is in the container.
+  `tests/test_exitcodes.py` pins this by stubbing out every `find_wb_keygen` probe and asserting
+  a lib-free APK still exits 0.
+
+- **`_LoaderView.loads` tuples must stay 4-tuples.** `vaddr_to_off` unpacks them positionally, so
+  `p_flags` went into a parallel `load_flags` list rather than a fifth element. Note also that
+  `p_flags` sits at a DIFFERENT offset per ELF class - right after `p_type` on ELF64, at the end
+  of the entry on ELF32 - and reading the ELF64 slot on a 32-bit header silently returns
+  `p_offset`.
 
 - **An unknown or misplaced config key must be an ERROR, at every nesting level.** This is the
   guard that replaces argparse, and it is the failure mode the whole config design has to

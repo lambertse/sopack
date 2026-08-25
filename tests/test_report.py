@@ -102,6 +102,19 @@ def test_signed_is_none_when_signing_was_never_reached():
     assert _built(RepackResult(signed=True))["signed"] is True
 
 
+def test_passthrough_distinguishes_the_third_meaning_of_unsigned():
+    """`signed: false` now has three causes and only two are degradations: signing was disabled
+    or failed, the output is an AAB (never signed), or NOTHING WAS REWRITTEN - in which case the
+    input's own signature is still on the file. A batch consumer treating `signed == false` as
+    "broken" flags all three otherwise, so the discriminator has to be in the record.
+    """
+    plain = _built(RepackResult(signed=False))
+    assert plain["passthrough"] is False
+    passthrough = _built(RepackResult(signed=False, passthrough=True))
+    assert passthrough["passthrough"] is True
+    assert passthrough["encrypted_count"] == 0
+
+
 # ---- the index line -----------------------------------------------------------------------
 def test_index_line_carries_counts_but_not_the_arrays():
     """Keeping the line small is what keeps its append atomic against a concurrent pack. The

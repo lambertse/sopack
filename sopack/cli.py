@@ -45,7 +45,7 @@ from .config import DEFAULT_CONFIG_NAME, SAMPLE_YAML, Config, ConfigError, load
 from .container import (APK as APK_CONTAINER, abi_of as _abi_of,
                         detect as detect_container)
 from .elf_inject import InjectError
-from .errors import InputError, ToolMissingError
+from .errors import AlreadyPackedError, InputError, ToolMissingError
 from .provision import ProvisionError
 from .stubs import SUPPORTED_ABIS, StubMissingError
 
@@ -277,9 +277,20 @@ def _cmd_pack(args: argparse.Namespace, ctx: dict) -> int:
                     log=cfg.logging.stub_log,
                     allow_helper_log=cfg.logging.allow_helper_log,
                     exclude_libs=excludes, no_sign=not cfg.signing.sign,
-                    obfuscate=cfg.obfuscate,
+                    obfuscate=cfg.obfuscate, allow_repack=cfg.allow_repack,
                     logger=diag.emit, container=cont)
     ctx["res"] = res
+
+    # Nothing was rewritten, so every block below describes work that did not happen: the
+    # injected list and the per-library summary are empty, the signature dump has nothing to
+    # read, and BOTH closing notes would be false - the output is neither re-signed nor
+    # "UNSIGNED and cannot be installed", it is the input, signature and all.
+    if res.passthrough:
+        diag.emit(f"\nNothing to encrypt - no {cont.lib_shape} entries in this {cont.noun}.")
+        diag.emit(f"\nDone: {args.output}")
+        diag.emit("Note: this is an unchanged copy of the input, including its original "
+                  "signature. sopack did not modify it.")
+        return exitcodes.OK
 
     diag.emit(f"\nInjected {len(res.injected)} librar{'y' if len(res.injected)==1 else 'ies'}:")
     for ir in res.injected:
@@ -383,6 +394,10 @@ def build_parser() -> argparse.ArgumentParser:
 # precedence, and an isinstance dispatch over one silently depends on insertion order.
 _CODE_FOR = (
     (ConfigError, exitcodes.CONFIG),
+    # Above the RuntimeError catch-all, which it subclasses. Without this entry a re-pack
+    # refusal would report itself as exit 1, "sopack has a bug" - which is exactly the
+    # mis-blaming this error class was added to end.
+    (AlreadyPackedError, exitcodes.ALREADY_PACKED),
     (SelectionError, exitcodes.SELECTION),
     (NothingPackedError, exitcodes.NOTHING_ENCRYPTED),
     (StubMissingError, exitcodes.TOOLCHAIN),

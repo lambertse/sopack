@@ -40,6 +40,14 @@ REGION_MAGIC = TARGET_REGION_MAGIC
 # `-Wl,-soname,libsopk_wb.so` and the packer must never rename it. See stub/sopk_wb.c.
 PROVIDER_SONAME = "libsopk_wb.so"
 PROVIDER_ENTRY = "sopk_wb_k"
+
+# The fixed prefix of every THIN per-target helper's soname (elf_inject._helper_soname_for
+# appends the sanitised target name to it). Hoisted into a constant because two unrelated places
+# now depend on it: the emitter that builds the name, and `detect.py`, which recognises an
+# already-packed container by it - both from the ZIP entry list and from the DT_NEEDED string the
+# TARGET itself carries. A literal in each would drift silently, and a detector that fails open
+# means sopack re-packs its own output.
+HELPER_SONAME_PREFIX = "libsopk_rt_"
 # Must equal SOPK_WB_ABI in stub/sopk_wb.h, which tracks SOPK_RT_REGION_VERSION. Passed on every
 # provider call so a mismatched helper/provider PAIR fails cleanly on the first call.
 PROVIDER_ABI = REGION_VERSION

@@ -12,9 +12,14 @@ That mattered most for `wb_keygen`: "could not find a host wb_keygen" is the fir
 docs/TROUBLESHOOTING.md and the most-hit failure on a fresh checkout, and reporting it as an
 input error sends the reader to look at their APK instead of at their toolchain.
 
-Both subclass `FileNotFoundError` deliberately, so every pre-existing `except FileNotFoundError`
-keeps catching them - notably `apk.repackage`'s best-effort signing path, which demotes a missing
-apksigner to a warning rather than failing the pack.
+`ToolMissingError` and `InputError` both subclass `FileNotFoundError` deliberately, so every
+pre-existing `except FileNotFoundError` keeps catching them - notably `apk.repackage`'s
+best-effort signing path, which demotes a missing apksigner to a warning rather than failing the
+pack.
+
+`AlreadyPackedError` is the fourth resident and is unrelated to that split. It lives here, rather
+than in `apk.py` beside its nearest relatives `NothingPackedError` and `SelectionError`, because
+`detect.py` raises it and must stay importable without dragging in the packer.
 
 This module imports nothing from sopack, so it can be imported from any layer without a cycle.
 """
@@ -28,6 +33,31 @@ class ToolMissingError(FileNotFoundError):
     exit 7: one is fixed by installing an SDK or a JDK, the other by running a build script. The
     message says which.
     """
+
+
+class AlreadyPackedError(RuntimeError):
+    """The input container already carries sopack's own artifacts - it is a packed OUTPUT.
+
+    Re-packing is never what the caller meant, and for `cipher: wbaes` it is actively
+    destructive: a second pack seals a NEW long-term key, and the pre-existing
+    `libsopk_wb.so` cannot be replaced without orphaning every thin helper already inside,
+    so `apk.py`'s collision guard aborts. That guard raises a bare `RuntimeError`, i.e.
+    exit 1 "internal error", which blames the packer for a bad input; this class exists so
+    the condition gets its own code (`exitcodes.ALREADY_PACKED`) and a message naming the
+    evidence. The stub ciphers have no such guard at all and would silently double-encrypt.
+
+    NOT a subclass of `apk.NothingPackedError`: nothing was attempted, let alone packed, and
+    inheriting would make the two codes' precedence in `cli._CODE_FOR` depend on ordering
+    for no reason. `RuntimeError` is deliberate, though - `cli.main`'s except-tuple already
+    lists it, so this is caught with no change there.
+
+    `.entries` holds the evidence, so the message can name what was found rather than
+    asserting a conclusion the operator cannot check.
+    """
+
+    def __init__(self, message: str, entries: "list[str] | None" = None) -> None:
+        super().__init__(message)
+        self.entries = list(entries or ())
 
 
 class InputError(FileNotFoundError):

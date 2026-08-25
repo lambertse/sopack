@@ -249,9 +249,16 @@ prints.
 
 `sopack pack` returns a **stable exit code per failure class** so a wrapper can branch without
 parsing prose: `0` ok, `2` usage, `3` config, `4` input APK, `5` library selection, `6` nothing
-encrypted, `7` toolchain, `8` injection, `9` signing, `10` output, `1` internal. The *count* of
-encrypted libraries is not in the exit status - an exit status is 8 bits and cannot carry both a
-class and a count - so read it from the record:
+encrypted, `7` toolchain, `8` injection, `9` signing, `10` output, `11` already packed, `1`
+internal. The *count* of encrypted libraries is not in the exit status - an exit status is 8 bits
+and cannot carry both a class and a count, and negative codes cannot cross a process boundary at
+all (`sys.exit(-1)` arrives as `255`) - so read the count from the record:
+
+Two boundaries are worth stating outright, because both are cases where "it did nothing" is not
+a failure. An input with **no native libraries at all** exits `0`: sopack could never have
+protected anything, so it copies the input through unchanged and records `passthrough: true`.
+An input that **does** have native libraries and protected none of them stays `6`. And an input
+that is one of sopack's own **outputs** is refused with `11` rather than silently double-encrypted.
 
 ```bash
 sopack pack in.apk -o out.apk; echo "exit=$?"

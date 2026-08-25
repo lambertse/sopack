@@ -37,9 +37,10 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import detect as detect_packed
 from . import diag
 from .container import APK as APK_CONTAINER, Container, detect as detect_container
-from .errors import ToolMissingError
+from .errors import AlreadyPackedError, ToolMissingError
 from .elf_inject import InjectError, InjectResult, inject_so
 from .stubs import DEFAULT_ABIS, SUPPORTED_ABIS
 
@@ -208,6 +209,8 @@ class RepackResult:
     #   * signing.sign: false          - the caller asked for it
     #   * no apksigner on this machine - best-effort; the pack itself is done
     #   * the output is an AAB         - sopack never signs a bundle (see the signing block below)
+    #   * the pack was a passthrough   - nothing was rewritten, so the input's OWN signature is
+    #                                    still on it (see `passthrough` below)
     # An unsigned APK cannot be installed until something signs it, so the CLI has to say so
     # rather than letting a successful-looking pack imply an installable artifact. Consequence for
     # anyone consuming report.json: `signed: false` is NOT on its own a "this pack went wrong"
@@ -240,6 +243,16 @@ class RepackResult:
     # the container - both are the operator's call, not the packer's). It reports it, so the
     # exposure is measured on every pack instead of invisible.
     cross_abi_cleartext: list[tuple[str, list[str]]] = field(default_factory=list)
+    # True when the container held NO native libraries at all, so there was nothing sopack
+    # could ever have protected and the input was copied through byte-for-byte. Not a
+    # degradation and not an error - a pure-Java/Kotlin APK is a normal input for a pipeline
+    # that packs every build - but it does change what the artifact IS, so it has to be
+    # visible rather than inferred from `encrypted_count: 0`.
+    #
+    # It is also the third thing that sets `signed: false`, and the only one where that does
+    # NOT mean "you must sign this before installing": the ORIGINAL signature is still intact,
+    # because nothing was rewritten. Read `signed` together with `container` AND this.
+    passthrough: bool = False
 
 
 def find_cross_abi_cleartext(all_entries, protected, cont) -> list[tuple[str, list[str]]]:
@@ -356,6 +369,12 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
               # Stub ciphers only - wbaes does not use the stub at all.
               obfuscate: bool = False,
               no_sign: bool = False,
+              # Proceed even when the input is recognisably a sopack OUTPUT. Off by default:
+              # re-packing is destructive in wbaes mode and uncharacterised in the stub modes
+              # (see sopack/detect.py). The escape hatch exists because detection reads
+              # evidence out of arbitrary third-party binaries, and an operator who knows
+              # better than the detector needs a way through that is not "edit the packer".
+              allow_repack: bool = False,
               logger=print,
               # None means "look at the file". Detection is by content, so a library caller
               # normally leaves this alone; it exists so cli.py, which has already detected the
@@ -384,6 +403,52 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
             "prints the target soname, its .text address and size, and per-stage timings to "
             "logcat, and ships those strings in cleartext in every packed library. The result "
             "is a diagnostic artifact - DO NOT SHIP IT.")
+
+    # ---- central-directory pre-scan --------------------------------------------------
+    # One read of the entry list, answering two questions that must both be settled BEFORE the
+    # wbaes preflight below. Both would otherwise be reported as something they are not.
+    with zipfile.ZipFile(in_apk, "r") as zpre:
+        entry_names = zpre.namelist()
+
+    # 1. Is this already one of our own outputs? The cheap tier only - it needs no
+    #    decompression and catches every wbaes pack, which is the default cipher. The
+    #    per-library tier runs inside the entry loop, where the bytes are already in hand.
+    if not allow_repack:
+        packed_entries = detect_packed.scan_entries(entry_names, cont)
+        if packed_entries:
+            shown = ", ".join(packed_entries[:4])
+            more = f" (+{len(packed_entries) - 4} more)" if len(packed_entries) > 4 else ""
+            raise AlreadyPackedError(
+                f"this {cont.noun} is already packed by sopack: it contains {shown}{more}. "
+                f"Re-packing would seal a second white-box key that the helpers already inside "
+                f"cannot unwrap. Pack the ORIGINAL {cont.noun}, or set `allow-repack: true` if "
+                f"you are certain.", packed_entries)
+
+    # 2. Are there any native libraries at all? A container with none is NOT an error: sopack
+    #    could never have protected anything, and a pipeline that packs every build hands us
+    #    pure-Java/Kotlin APKs as a matter of course. Copy the input through and return.
+    #
+    #    This sits ABOVE the wbaes preflight deliberately. find_wb_keygen raises
+    #    ToolMissingError (exit 7), so checking afterwards would leave a lib-free APK failing
+    #    on any host without a host wb_keygen - a chacha20-only portable bundle, say - for a
+    #    reason that has nothing to do with the input. There is nothing to seal here.
+    #
+    #    An EXPLICIT `libraries.include` still fails, and does so further down the same way it
+    #    always has: the user named libraries that this container does not contain, which is a
+    #    mistake worth reporting (SelectionError, exit 5). Only auto-select is forgiving.
+    if auto and not any(cont.lib_re.match(n) for n in entry_names):
+        # note_warning, not warn: with the exit code now 0, the run record is the only place a
+        # batch consumer can still find this.
+        diag.note_warning(
+            f"WARNING: this {cont.noun} has no {cont.lib_shape} entries at all - there is "
+            f"nothing for sopack to encrypt. The input was copied to the output unchanged.")
+        # Verbatim, so the original signature survives: nothing was rewritten, so there is
+        # nothing for a signature to have stopped matching. (copyfile raises SameFileError if
+        # -o names the input, which is the right refusal - it would otherwise truncate it.)
+        shutil.copyfile(in_apk, out_apk)
+        result.passthrough = True
+        result.signed = False           # sopack did not sign it; the INPUT's signature is intact
+        return result
 
     # wbaes preflight: resolve a RUNNABLE host wb_keygen now, so a wrong tool fails before we
     # start injecting (not mid-pack). Also surfaces the Android-vs-host mistake up front.
@@ -448,6 +513,30 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
                 select, why = (False, "")
                 if m:
                     candidates += 1
+                    # The second detection tier, run over EVERY candidate rather than only the
+                    # selected ones - sopack's own artifacts are in ALWAYS_EXCLUDE_PATTERNS, so
+                    # a selection-scoped check would never look at them. `data` is already in
+                    # memory (read unconditionally above), so this costs a byte scan and one
+                    # raw ELF parse.
+                    #
+                    # Raising here is safe: every intermediate lives in `tmp` and `out_apk` is
+                    # not written until the very end, so an abort leaves no partial output.
+                    if not allow_repack:
+                        packed_why = detect_packed.scan_library(data)
+                        if packed_why:
+                            raise AlreadyPackedError(
+                                f"{name} is already packed by sopack: {packed_why}. Re-packing "
+                                f"would encrypt ciphertext a second time. Pack the ORIGINAL "
+                                f"{cont.noun}, or set `allow-repack: true` if you are certain.",
+                                [name])
+                        maybe = detect_packed.scan_library_heuristic(data)
+                        if maybe:
+                            # Advisory ONLY. Other packers emit this same shape, and refusing
+                            # a legitimate pack on a guess is worse than encrypting twice.
+                            diag.note_warning(
+                                f"WARNING: {name} looks like it may already be packed "
+                                f"({maybe}). Packing it again is probably not what you want. "
+                                f"If it is, this warning is harmless.")
                     select, why = _classify(name, m["abi"], m["so"],
                                             wanted, abis_set, excludes)
                     # Every selection decision, including the ones _print_summary collapses to a
@@ -632,13 +721,18 @@ def repackage(in_apk: str, out_apk: str, wanted_libs: list[str] | None,
             # skips, which are the actual diagnosis, and they would otherwise be discarded by the
             # raise and survive only as terminal output.
             if not auto:
+                # Still an error, and deliberately so even when the container holds no native
+                # libraries at all. The pre-scan's passthrough is scoped to auto-select: the
+                # user who wrote `libraries.include` vouched for those names, and packing
+                # nothing while reporting success would hide a typo'd or stale library list.
                 raise SelectionError(
                     "no .so entries matched the requested list; nothing to encrypt. "
                     f"requested={sorted(wanted)}", result)
-            if candidates == 0:
-                raise NothingPackedError(
-                    f"this {cont.noun} has no {cont.lib_shape} entries at all; nothing to "
-                    "encrypt.", result)
+            # `candidates == 0` cannot reach here any more: under auto-select the pre-scan at
+            # the top of this function copies the input through and returns before the entry
+            # loop runs. So everything below means "there WERE libraries and none got packed",
+            # which stays a failure - something shipped in cleartext that the operator expected
+            # to be protected.
             raise NothingPackedError(
                 f"none of the {candidates} {cont.lib_shape} entries in this {cont.noun} were "
                 f"packed: "

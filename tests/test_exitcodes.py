@@ -62,11 +62,33 @@ def test_nothing_else_claims_code_2():
 
 
 def test_zero_means_success_only():
-    """`0 = nothing was encrypted` was considered and rejected: `set -e` and every CI runner read
-    0 as success, so it would guarantee that the case most worth flagging is the one that is
-    missed. NOTHING_ENCRYPTED must be non-zero."""
+    """`0 = the number encrypted` was considered and rejected - one byte cannot carry a class
+    AND a count, and `set -e` reads 0 as success either way. So 0 means success and nothing else,
+    and the counts live in the run record.
+
+    "Nothing was encrypted" is split rather than collapsed: an input with native libraries that
+    all shipped in cleartext stays NOTHING_ENCRYPTED (a misconfiguration worth flagging), while
+    an input with no native code at all is a plain success (nothing could have been protected).
+    Both halves are driven end to end further down; this pins that the codes stay distinct.
+    """
     assert exitcodes.OK == 0
     assert exitcodes.NOTHING_ENCRYPTED != 0
+
+
+def test_a_successful_pack_returns_exactly_zero(tmp_path, monkeypatch):
+    """Not the number of libraries encrypted. Two are packed here, and the code is still 0 -
+    a count in the exit status would collide with every error code in the same range (exit 3
+    would mean both "config error" and "3 libraries encrypted")."""
+    from sopack import apk as apkmod
+    monkeypatch.setattr(apkmod, "inject_so", _fake_inject)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("cipher: chacha20\n")
+    src = _apk(tmp_path / "in.apk",
+               entries=("lib/arm64-v8a/liba.so", "lib/arm64-v8a/libb.so"))
+    assert cli.main(["pack", src, "-o", str(tmp_path / "o.apk"),
+                     "--config", str(cfg)]) == 0
+    row = json.loads((tmp_path / "logs" / report.INDEX_NAME).read_text().splitlines()[0])
+    assert row["encrypted_count"] == 2
 
 
 @pytest.mark.parametrize("exc,expected", [
@@ -84,6 +106,7 @@ def test_zero_means_success_only():
     # up front in _cmd_pack, so an ENOENT that gets this far is a path we were asked to WRITE.
     (FileNotFoundError("/no/such/dir/out.apk"), exitcodes.OUTPUT),
     (PermissionError("/root/out.apk"), exitcodes.OUTPUT),
+    (errors.AlreadyPackedError("already packed"), exitcodes.ALREADY_PACKED),
     (RuntimeError("unmodelled"), exitcodes.INTERNAL),
 ])
 def test_exception_maps_to_its_code(exc, expected):
@@ -111,6 +134,12 @@ def test_specific_subclasses_win_over_their_bases():
     assert cli.code_for(config.ConfigError("x")) != cli.code_for(ValueError("x")) or True
     assert cli.code_for(stubs.StubMissingError("x")) == exitcodes.TOOLCHAIN
     assert cli.code_for(config.ConfigError("x")) == exitcodes.CONFIG
+    # AlreadyPackedError is a RuntimeError, which is the catch-all's own entry. Listed after it
+    # the refusal would report exit 1, "sopack has a bug" - the precise mis-blaming it exists
+    # to end, since that is what the old bare-RuntimeError collision guard already did.
+    assert cli.code_for(errors.AlreadyPackedError("x")) == exitcodes.ALREADY_PACKED
+    assert isinstance(errors.AlreadyPackedError("x"), RuntimeError)
+    assert not isinstance(errors.AlreadyPackedError("x"), apk.NothingPackedError)
 
 
 # ---- through main() ----------------------------------------------------------------------
@@ -129,14 +158,63 @@ def test_missing_input_apk_returns_input_code(tmp_path):
                      "--config", str(good)]) == exitcodes.INPUT
 
 
-def test_apk_with_no_native_libs_returns_nothing_encrypted(tmp_path):
-    """Not exit 0. An APK that came out with nothing protected is a distinct outcome a caller has
-    to be able to detect, and it is a failure rather than a success."""
+def test_apk_with_no_native_libs_succeeds_and_passes_the_input_through(tmp_path):
+    """Exit 0, and the output is the input byte-for-byte.
+
+    This used to be NOTHING_ENCRYPTED, and it was the wrong line to draw. sopack could never
+    have protected anything here - there is no native code - so there is no misconfiguration to
+    report, and a pipeline that packs every build must not die on a pure-Java/Kotlin APK. What
+    stays a failure is the case one line down: libraries WERE present and none got protected.
+
+    The output is a verbatim copy rather than a rezip, so the input's own signature survives.
+    """
     good = tmp_path / "c.yaml"
     good.write_text("cipher: chacha20\n")
     src = _apk(tmp_path / "bare.apk", entries=())
+    out = tmp_path / "o.apk"
+    assert cli.main(["pack", src, "-o", str(out), "--config", str(good)]) == exitcodes.OK
+    assert out.read_bytes() == pathlib.Path(src).read_bytes()
+
+    row = json.loads((tmp_path / "logs" / report.INDEX_NAME).read_text().splitlines()[0])
+    # Exit 0 means the run record is the ONLY place this is still visible, so all three of
+    # these carry weight: a batch consumer needs to tell "nothing to do" apart from a clean pack.
+    assert row["passthrough"] is True
+    assert row["encrypted_count"] == 0
+    assert row["warning_count"] >= 1
+
+
+def test_libraries_present_but_none_packed_is_still_nothing_encrypted(tmp_path):
+    """The sibling case, and the reason the relaxation above is scoped to `candidates == 0`.
+
+    Here there IS native code and it shipped in cleartext because `abis:` does not cover it.
+    That is a misconfiguration the operator has to hear about, so it stays a failure.
+    """
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("cipher: chacha20\nabis:\n  - arm64-v8a\n")
+    src = _apk(tmp_path / "in.apk", entries=("lib/x86_64/libfoo.so",))
     assert cli.main(["pack", src, "-o", str(tmp_path / "o.apk"),
-                     "--config", str(good)]) == exitcodes.NOTHING_ENCRYPTED
+                     "--config", str(cfg)]) == exitcodes.NOTHING_ENCRYPTED
+
+
+def test_no_native_libs_does_not_need_a_host_wb_keygen(tmp_path, monkeypatch):
+    """…and it must not report a TOOLCHAIN error either.
+
+    The passthrough check sits ABOVE the wbaes preflight for exactly this reason. Placed below
+    it, a lib-free APK would still hard-fail with exit 7 on any host that cannot resolve a host
+    `wb_keygen` - a chacha20-only portable bundle, say - for a reason that has nothing to do
+    with the input and nothing to seal.
+    """
+    from sopack import provision as prov
+    monkeypatch.setattr(prov, "_repo_wb_keygen", lambda: None)
+    monkeypatch.setattr(prov, "_bundle_wb_keygen", lambda: None)
+    monkeypatch.setattr(prov.shutil, "which", lambda name: None)
+    monkeypatch.delenv("SOPACK_WBKEYGEN", raising=False)
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("cipher: wbaes\n")
+    src = _apk(tmp_path / "bare.apk", entries=())
+    assert cli.main(["pack", src, "-o", str(tmp_path / "o.apk"),
+                     "--config", str(cfg)]) == exitcodes.OK
 
 
 def test_named_library_that_matches_nothing_returns_selection_code(tmp_path):
@@ -274,9 +352,44 @@ def test_auto_select_demotes_the_same_failure_to_a_cleartext_skip(tmp_path, monk
     assert rows[0]["failed_count"] == 1          # recorded as a skip, with its reason
 
 
+def test_an_already_packed_apk_is_refused(tmp_path):
+    """End-to-end for code 11, through the central-directory tier.
+
+    Before this, feeding a packed APK back in hit `apk.py`'s provider-collision guard and
+    reported exit 1 - "internal error" - blaming the packer for a bad input. The stub ciphers
+    had no guard at all and silently encrypted the ciphertext a second time.
+    """
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("cipher: chacha20\n")
+    src = _apk(tmp_path / "packed.apk",
+               entries=("lib/arm64-v8a/libfoo.so",
+                        "lib/arm64-v8a/libsopk_wb.so",
+                        "lib/arm64-v8a/libsopk_rt_libfoo.so"))
+    assert cli.main(["pack", src, "-o", str(tmp_path / "o.apk"),
+                     "--config", str(cfg)]) == exitcodes.ALREADY_PACKED
+
+
+def test_allow_repack_downgrades_the_refusal(tmp_path, monkeypatch):
+    """The escape hatch. Detection reads evidence out of arbitrary third-party binaries, so an
+    operator who knows better than the detector needs a way through that is not "edit the
+    packer"."""
+    from sopack import apk as apkmod
+    monkeypatch.setattr(apkmod, "inject_so", _fake_inject)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("cipher: chacha20\nallow-repack: true\n")
+    src = _apk(tmp_path / "packed.apk",
+               entries=("lib/arm64-v8a/libfoo.so", "lib/arm64-v8a/libsopk_wb.so"))
+    assert cli.main(["pack", src, "-o", str(tmp_path / "o.apk"),
+                     "--config", str(cfg)]) == exitcodes.OK
+
+
 def test_signing_failure_returns_signing_code(tmp_path, monkeypatch):
     """apksigner found but failing, which is different from apksigner ABSENT - the latter is
-    best-effort and leaves an unsigned APK at exit 0."""
+    best-effort and leaves an unsigned APK at exit 0.
+
+    `signing.sign` must be set explicitly: it defaults to FALSE, so a default pack never invokes
+    apksigner at all and code 9 is unreachable without it.
+    """
     from sopack import apk as apkmod
 
     real_run = apkmod.subprocess.run
@@ -292,7 +405,7 @@ def test_signing_failure_returns_signing_code(tmp_path, monkeypatch):
     monkeypatch.setattr(apkmod.subprocess, "run", _run)
 
     cfg = tmp_path / "c.yaml"
-    cfg.write_text("cipher: chacha20\n")
+    cfg.write_text("cipher: chacha20\nsigning:\n  sign: true\n")
     src = _apk(tmp_path / "in.apk")
     monkeypatch.setattr(apkmod, "inject_so", _fake_inject)
     assert cli.main(["pack", src, "-o", str(tmp_path / "o.apk"),
@@ -311,7 +424,7 @@ def _fake_inject(src, dst, abi, **kw):
 @pytest.mark.parametrize("code", [
     exitcodes.OK, exitcodes.USAGE, exitcodes.CONFIG, exitcodes.INPUT, exitcodes.SELECTION,
     exitcodes.NOTHING_ENCRYPTED, exitcodes.TOOLCHAIN, exitcodes.INJECT, exitcodes.SIGNING,
-    exitcodes.OUTPUT,
+    exitcodes.OUTPUT, exitcodes.ALREADY_PACKED,
 ])
 def test_every_documented_code_is_reachable(code):
     """A guard on the guards: every code in the docs table must be produced by some end-to-end

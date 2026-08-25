@@ -31,6 +31,17 @@ cipher: wbaes
 # packs. The seed used is recorded in report.json.
 obfuscate: false
 
+# Pack a container that sopack has ALREADY packed. Off by default, and the refusal
+# has its own exit code (11). Re-packing is destructive in wbaes mode - the second
+# pack seals a new white-box key that the helpers already inside cannot unwrap - and
+# in the stub modes it encrypts ciphertext a second time.
+#
+# Detection is two-tiered. sopack's own added entries (libsopk_wb.so, libsopk_rt_*)
+# and the markers inside them REFUSE the pack; a library that merely has the SHAPE of
+# a packed one (some other vendor's packer looks similar) only warns. This key
+# downgrades the refusal to a warning as well.
+allow-repack: false
+
 # A list, or the string "all" for every supported ABI
 # (arm64-v8a, armeabi-v7a, x86_64). arm64-v8a is the only ABI protected in
 # practice; the others ship their .text in cleartext.
@@ -81,8 +92,13 @@ libraries:
 # cannot read one, and the signature Play checks is your upload key). A packed AAB
 # is always handed back UNSIGNED, for you to sign with jarsigner.
 signing:
-  sign: true            # false == the old --no-sign: leave the APK UNSIGNED
-  verify: true          # print the signer certificates after signing
+  # OFF by default: sopack signs with a GENERATED DEBUG keystore, which gives the
+  # output a new app identity that cannot update-install over the original. The
+  # default output is therefore a packed, 16 KB-aligned, UNSIGNED APK - sign it with
+  # your own key, which apksigner can do afterwards without disturbing the alignment.
+  # Set this to true to have sopack self-sign with the keystore below.
+  sign: false
+  verify: true          # print the signer certificates after signing (only when sign: true)
   min-sdk:              # override apksigner minSdkVersion if manifest detection fails
 
   keystore:
