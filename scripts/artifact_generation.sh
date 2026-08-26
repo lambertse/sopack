@@ -53,6 +53,13 @@
 #                        macOS nor Linux), or deliberately cut a keygen-free bundle on one that
 #                        can. bin/wb_keygen is OMITTED and the bundle's config.yaml pins
 #                        cipher: chacha20 (xor also works; wbaes cannot).
+#   --trace              build TRACING skeletons (-DSOPK_RT_LOG) instead of release ones, so the
+#                        injected helper logs each decrypt to logcat. The result is a DIAGNOSTIC
+#                        bundle and is NOT shippable: those lines hand anyone with adb the target
+#                        soname, .text address and size. Gate 3 inverts (a RELEASE skeleton then
+#                        fails the run), config.yaml pins logging.allow-helper-log AND
+#                        signing.sign, and MANIFEST.txt records skeleton-build: tracing.
+#                        Incompatible with --allow-foreign-host.
 #   --allow-unobfuscated-provider
 #                        build libsopk_wb.so WITHOUT O-MVLL. The provider is the artifact whose
 #                        static-analysis resistance matters most, so this is never implied - not
@@ -86,6 +93,7 @@ REBUILD_STUBS=0
 FORCE=0
 ALLOW_FOREIGN=0
 ALLOW_UNOBF=0
+TRACE_BUNDLE=0
 MAKE_TAR=0
 # 2: the bundle carries sopack-*.whl and MANIFEST.txt gained a `wheel:` field. A format-1 bundle
 # installed itself by copying into an existing editable checkout, which no longer exists as a
@@ -105,14 +113,29 @@ while [ "$#" -gt 0 ]; do
         --force)              FORCE=1; shift ;;
         --allow-foreign-host) ALLOW_FOREIGN=1; shift ;;
         --allow-unobfuscated-provider) ALLOW_UNOBF=1; shift ;;
+        --trace)              TRACE_BUNDLE=1; shift ;;
         --tar)                MAKE_TAR=1; shift ;;
-        # 2..64 is the header comment block; it ends at the "SOPACK is this script's own repo"
+        # 2..71 is the header comment block; it ends at the "SOPACK is this script's own repo"
         # line, immediately before `set -euo pipefail`. Widen this if the header grows, or
-        # --help starts printing shell code.
-        -h|--help)            sed -n '2,64p' "$0"; exit 0 ;;
+        # --help starts printing shell code. (It was 2..64 until --trace's entry was added -
+        # the tail silently truncated mid-option instead of erroring, so re-check the boundary
+        # whenever this block gains lines.)
+        -h|--help)            sed -n '2,71p' "$0"; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
+
+# --trace is a wbaes-only axis. --allow-foreign-host pins cipher: chacha20, which uses the
+# freestanding STUB and never loads a wbaes skeleton at all - so logging.allow-helper-log is
+# inert there and tracing would need stub/build_stubs.sh --with-log plus logging.stub-log, a
+# different mechanism entirely. Accepting the pair would ship a bundle advertising
+# skeleton-build: tracing that traces nothing.
+if [ "$TRACE_BUNDLE" -eq 1 ] && [ "$ALLOW_FOREIGN" -eq 1 ]; then
+    die "--trace and --allow-foreign-host are incompatible. --allow-foreign-host pins
+       cipher: chacha20, which uses the freestanding stub, not the wbaes skeletons --trace
+       builds - so the bundle would trace nothing. For stub tracing use
+       'bash stub/build_stubs.sh --with-log' and set logging.stub-log in the config."
+fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/sopack-bundle.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -262,7 +285,14 @@ else
     # them separate means a future divergence has somewhere truthful to be recorded.
     HELPER_OBFUSCATION="$PROVIDER_OBFUSCATION"
     WBC_OBFUSCATION="$PROVIDER_OBFUSCATION"
-    BUILD_ARGS="--release $OMVLL_ARG --abi $ABI --api $API"
+    if [ "$TRACE_BUNDLE" -eq 1 ]; then
+        warn "--trace: building TRACING skeletons (-DSOPK_RT_LOG). This bundle is a DIAGNOSTIC
+      artifact - every packed app logs its target soname, .text address and size to logcat.
+      DO NOT SHIP anything it produces."
+        BUILD_ARGS="--trace $OMVLL_ARG --abi $ABI --api $API"
+    else
+        BUILD_ARGS="--release $OMVLL_ARG --abi $ABI --api $API"
+    fi
     [ "$FORCE" -eq 1 ] && BUILD_ARGS="$BUILD_ARGS --force"
     # shellcheck disable=SC2086
     if ! ( cd "$SOPACK" && ./scripts/build_wbaes.sh $BUILD_ARGS --wbc "$WBC" --ndk "$NDK" ) \
@@ -286,15 +316,42 @@ say "artifact gates"
 #    "the file exists" says nothing about which build it is. A tracing helper logs the target
 #    name, .text address and size at load, and `sopack pack` refuses it unless the config says
 #    logging.allow-helper-log - so bundling one ships something either rejected or unsafe.
-for so in "$SKEL" "$PROV"; do
-    if grep -qa '__android_log_print' "$so"; then
-        die "$(basename "$so") is a TRACING build (-DSOPK_RT_LOG): it imports
+# Measured from the ARTIFACTS, never from the flag: --skip-build can hand us a pair this run
+# did not build, and a shared object records no build mode other than what it imports.
+SKEL_TRACE=0
+PROV_TRACE=0
+if grep -qa '__android_log_print' "$SKEL"; then SKEL_TRACE=1; fi
+if grep -qa '__android_log_print' "$PROV"; then PROV_TRACE=1; fi
+
+# A MIXED pair is its own failure and neither branch below would catch it. It is reachable via
+# --skip-build over a half-rebuilt sopack/stubs/, and it ships a bundle whose logging depends on
+# which artifact you look at.
+if [ "$SKEL_TRACE" -ne "$PROV_TRACE" ]; then
+    die "the two skeletons disagree: $(basename "$SKEL") is $([ "$SKEL_TRACE" -eq 1 ] && echo TRACING || echo release)
+       but $(basename "$PROV") is $([ "$PROV_TRACE" -eq 1 ] && echo TRACING || echo release).
+       sopack/stubs/ was left half-rebuilt. Re-run without --skip-build."
+fi
+
+if [ "$TRACE_BUNDLE" -eq 1 ]; then
+    # INVERTED, not merely relaxed. Under --trace a RELEASE skeleton is the failure: the bundle
+    # would install, pack and run while logging nothing, and the operator would read that silence
+    # as "the decrypt never happened". "Cannot tell" is not a pass here either - hence a hard die
+    # rather than a warning, matching the Linux wb_keygen linkage gate.
+    [ "$SKEL_TRACE" -eq 1 ] || die "--trace was given, but the skeletons in sopack/stubs/ are
+       RELEASE builds (no __android_log_print), so the bundle would trace nothing. With
+       --skip-build, drop it so this run builds them; otherwise re-run and let build_wbaes.sh
+       --trace produce them."
+    SKELETON_BUILD="tracing"
+    warn "both skeletons are TRACING builds (--trace). Every app this bundle packs logs its
+      target soname, .text address and size to logcat. DIAGNOSTIC BUNDLE - DO NOT SHIP its output."
+else
+    [ "$SKEL_TRACE" -eq 0 ] || die "the skeletons are TRACING builds (-DSOPK_RT_LOG): they import
        __android_log_print. That is almost certainly device_test.sh's skeleton, which writes to
        the same path. Rebuild without --trace (./scripts/build_wbaes.sh --release) and re-run;
-       do not ship a diagnostic skeleton."
-    fi
-done
-ok "both skeletons are release builds (no __android_log_print)"
+       do not ship a diagnostic skeleton. If you WANT a diagnostic bundle, pass --trace."
+    SKELETON_BUILD="release"
+    ok "both skeletons are release builds (no __android_log_print)"
+fi
 
 # O-MVLL provenance. wbc-rev used to identify the obfuscator only as a side effect of WBC
 # owning the pin; sopack owns it now, so wbc-rev no longer says anything about it. Record the
@@ -681,12 +738,14 @@ fi
 # repo root (the preflight above checks it exactly that way), but --out may be relative and
 # would then land somewhere else entirely.
 BUNDLE_CFG="$(cd "$OUT" && pwd)/config.yaml"
-( cd "$SOPACK" && python3 - "$BUNDLE_CFG" "$BUNDLE_CIPHER" "$ABI" "$BUNDLE_CIPHER_NOTE" <<'PY'
+( cd "$SOPACK" && python3 - "$BUNDLE_CFG" "$BUNDLE_CIPHER" "$ABI" "$BUNDLE_CIPHER_NOTE" \
+    "$SKELETON_BUILD" <<'PY'
 
 import re, sys
 from sopack.config import SAMPLE_YAML, loads
 
-dest, cipher, abi, cipher_note = sys.argv[1:5]
+dest, cipher, abi, cipher_note, skeleton_build = sys.argv[1:6]
+tracing = skeleton_build == "tracing"
 
 header = (
     "# sopack configuration for THIS bundle.\n"
@@ -694,10 +753,21 @@ header = (
     "#   sopack pack <your.apk> -o packed.apk --config <this file>\n"
     "#\n"
     "# This is the complete, commented config - the same file `sopack init-config` writes,\n"
-    "# with two values pinned to what this bundle can actually do (marked BUNDLE-PINNED\n"
+    "# with %d values pinned to what this bundle can actually do (marked BUNDLE-PINNED\n"
     "# below). Everything else is at its default. Edit any of it.\n"
     "\n"
+    % (4 if tracing else 2)
 )
+if tracing:
+    header += (
+        "# ---------------------------------------------------------------------------\n"
+        "# THIS IS A DIAGNOSTIC BUNDLE (generated with --trace). The helper it injects\n"
+        "# logs the target soname, .text address and size, and per-stage timings to\n"
+        "# logcat, in cleartext, in every packed library. DO NOT SHIP ITS OUTPUT.\n"
+        "#   adb logcat -s sopk_rt sopk_wb DEBUG\n"
+        "# ---------------------------------------------------------------------------\n"
+        "\n"
+    )
 
 # Anchored, and the replacement COUNT is checked: the sample's prose names every cipher and
 # every ABI in comments, and on the default arm64-v8a + keygen bundle the intended values are
@@ -717,6 +787,35 @@ if n != 1:
              "%d.\n       The abis: block changed shape; the bundle would ship the wrong ABI."
              % n)
 
+# The two TRACING pins. Both are required, and neither is cosmetic:
+#
+#   allow-helper-log  without it the packer REFUSES the tracing skeleton outright
+#                     (_check_wbaes_skeleton -> InjectError), so the bundle could not pack at
+#                     all. It is permissive only - it never adds logging.
+#   sign              a tracing bundle exists to be installed and watched. signing.sign
+#                     defaults to false, so the output would be an unsigned APK that adb
+#                     install rejects with INSTALL_PARSE_FAILED_NO_CERTIFICATES - the exact
+#                     pairing that already broke scripts/device_test.sh. A generated debug
+#                     certificate is right here: this artifact is a throwaway by construction.
+if tracing:
+    text, n = re.subn(r'(?m)^  allow-helper-log: false$',
+                      '  # BUNDLE-PINNED: this bundle carries TRACING skeletons; without this\n'
+                      '  # key the packer refuses them and no pack succeeds. NOT SHIPPABLE.\n'
+                      '  allow-helper-log: true', text)
+    if n != 1:
+        sys.exit("ERROR: expected exactly one '  allow-helper-log: false' line in SAMPLE_YAML, "
+                 "matched %d.\n       The logging: block changed shape; a tracing bundle would "
+                 "ship a config the\n       packer rejects on every pack." % n)
+
+    text, n = re.subn(r'(?m)^  sign: false$',
+                      '  # BUNDLE-PINNED: a tracing bundle is meant to be installed and watched,\n'
+                      '  # and adb install rejects an unsigned APK. Debug certificate.\n'
+                      '  sign: true', text)
+    if n != 1:
+        sys.exit("ERROR: expected exactly one '  sign: false' line in SAMPLE_YAML, matched %d.\n"
+                 "       The signing: block changed shape; the tracing bundle would emit an\n"
+                 "       unsigned APK that cannot be installed." % n)
+
 text = header + text
 
 # Parse it back with sopack's own loader: catches a substitution that matched but produced
@@ -725,6 +824,14 @@ cfg = loads(text, dest)
 if cfg.cipher != cipher or list(cfg.abis) != [abi]:
     sys.exit("ERROR: the generated bundle config parses as cipher=%s abis=%s, wanted %s / [%s]"
              % (cfg.cipher, list(cfg.abis), cipher, abi))
+# Parsed values, not the substituted text: a pin that matched but landed under the wrong parent
+# key would still count 1 above, and the failure would only show at pack time on a machine with
+# no checkout to debug it from.
+if tracing and not (cfg.logging.allow_helper_log and cfg.signing.sign):
+    sys.exit("ERROR: the tracing bundle config parses as allow-helper-log=%s sign=%s; both must "
+             "be true.\n       allow-helper-log false = every pack fails; sign false = the APK "
+             "cannot be installed."
+             % (cfg.logging.allow_helper_log, cfg.signing.sign))
 
 open(dest, "w").write(text)
 PY
@@ -750,7 +857,7 @@ host-arch: $HOST_ARCH
 abi: $ABI
 api: $API
 wheel: $WHEEL_NAME
-skeleton-build: release
+skeleton-build: $SKELETON_BUILD
 region-version: $REGION_VERSION
 helper-build-marker: $HELPER_MARKER
 provider-build-marker: $PROVIDER_MARKER
@@ -829,6 +936,18 @@ case "$(man provider-obfuscation)" in
     unknown) warn "this bundle was generated with --skip-build, so whether libsopk_wb.so is
       obfuscated is unrecorded - a shared object carries no such state. Regenerate without
       --skip-build if this is a release bundle." ;;
+esac
+# A tracing bundle must announce itself on the machine that installs it. The manifest alone
+# would go unread, and "it installed" must never quietly mean "it installed a diagnostic build".
+# Older bundles have no such field and `man` returns empty, so they stay silent and installable.
+case "$(man skeleton-build)" in
+    tracing) warn "this is a DIAGNOSTIC bundle: its skeletons were built with -DSOPK_RT_LOG
+      (--trace). Every app it packs logs the target soname, .text address and size, and
+      per-stage timings to logcat, as cleartext strings inside every packed library:
+          adb logcat -s sopk_rt sopk_wb DEBUG
+      Its config.yaml therefore pins logging.allow-helper-log: true and signing.sign: true.
+      DO NOT SHIP anything this bundle produces - regenerate without --trace for a release
+      bundle." ;;
 esac
 # Three obfuscation fields, because they are three separately-failable things. Older bundles
 # carry only provider-obfuscation, and `man` returns empty for a key that is not there - so an
@@ -1055,6 +1174,19 @@ cat <<EOF
   you need another.
   See README.md in this bundle for the tools you still need on this machine (JDK, apksigner).
 EOF
+if [ "$(man skeleton-build)" = "tracing" ]; then
+    cat <<EOF
+  DIAGNOSTIC BUNDLE (--trace): config.yaml already pins logging.allow-helper-log and
+  signing.sign, so a pack is installable and talks. Watch it decrypt with:
+
+      adb install -r packed.apk
+      adb logcat -c -b all
+      adb shell am start -n <pkg>/<launcher-activity>
+      adb logcat -d -s sopk_rt sopk_wb DEBUG
+
+  DO NOT SHIP its output.
+EOF
+fi
 INSTALL_SH
 chmod +x "$OUT/install.sh"
 

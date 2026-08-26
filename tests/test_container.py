@@ -257,7 +257,8 @@ def test_two_modules_share_one_real_sealed_blob(tmp_path):
         z.writestr("feature1/lib/arm64-v8a/libmini2.so", so)
 
     out = str(tmp_path / "out.aab")
-    res = apk.repackage(str(src), out, None, cipher="wbaes", logger=lambda *_: None)
+    res = apk.repackage(str(src), out, None, cipher="wbaes", logger=lambda *_: None,
+                        allow_helper_log=True)
     assert len(res.injected) == 2
 
     with zipfile.ZipFile(out) as z:

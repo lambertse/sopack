@@ -282,6 +282,15 @@ logging:
   # which is what the pass criterion counts. Packing one is refused without this, and the
   # resulting APK is NOT shippable.
   allow-helper-log: true
+signing:
+  # NOT the default: signing.sign defaults to false, so the shipped artifact is an unsigned
+  # APK the operator signs with their own key. But this harness calls adb install, and an
+  # unsigned APK is rejected with INSTALL_PARSE_FAILED_NO_CERTIFICATES before any of the
+  # on-device assertions below can run. A generated debug certificate is exactly right here:
+  # the packed app is a throwaway that gets uninstalled at the end of each test.
+  # NOTE: this heredoc is UNQUOTED (it interpolates \$ABI), so no backticks in these comments -
+  # they would be command substitution, mangling the text and running the contents as a command.
+  sign: true
 EOF
 info "pack config: $PACK_CONFIG"
 
