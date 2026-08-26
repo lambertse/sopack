@@ -467,10 +467,10 @@ excluded whatever the config says. Anything outside `abis:` is listed as `abi no
 
 ---
 
-## Skip: `injecting the target changed the dynamic symbol names` / `changed what '<sym>' resolves to`
+## Skip: `injecting the target changed the dynamic symbol names` / `moved '<sym>' by ...`
 
-Both come from `_assert_dynsyms_equivalent`, the `cipher: wbaes` guard that refuses to ship a
-library whose `dlsym` behaviour the injection changed. Which message you get says what happened,
+All of these come from `_assert_dynsyms_equivalent`, the `cipher: wbaes` guard that refuses to ship
+a library whose `dlsym` behaviour the injection changed. Which message you get says what happened,
 and they are not the same problem.
 
 **`changed the dynamic symbol names (e.g. 'x' -> 'y')`** - the set of dynamic symbol names is not
@@ -481,10 +481,13 @@ mid-string. The library would load and then return `NULL` from `dlsym`, which is
 refuses. There is nothing to configure - it means the write went wrong, so file it with the
 `report.json` from the run rather than working around it.
 
-**`changed what '<sym>' resolves to`, `left DT_HASH unable to resolve ...`, or `changed the symbol
-a relocation targets`** - the names survived, but a symbol moved to a different address/size, the
-hash chains no longer find it, or a relocation now points at a different symbol. Same conclusion:
-a broken write, not a configuration problem.
+**`moved '<sym>' by +N ... which is neither nothing nor the +D the image was rebased by`,
+`moved '<a>' ... but left '<b>' ... no single relayout`, `changed a dynamic symbol's kind, size,
+binding or version`, `left DT_HASH unable to resolve ...`, or `changed the symbol a relocation
+targets`** - the names survived, but a value is not explained by the image's own relayout, a
+defined symbol was left behind above one that moved, a record's size/binding/version changed, the
+hash chains no longer find a name, or a relocation now points at a different symbol. Same
+conclusion: a broken write, not a configuration problem.
 
 **A `WARNING: ... came out with .dynsym in a different ORDER` is not a failure.** LIEF normalises
 `.dynsym` (undefined entries first) when it rebuilds a library, and on a table that interleaves
@@ -493,6 +496,29 @@ continues. If you are on an older sopack that *skipped* such a library - reporti
 `'call_vm_loadTA' -> '_16923bf24c…L'` with the `DT_STRTAB ... out of sync` wording - that
 diagnosis was wrong: the guard compared index order, and the fix is in the packer, not the app.
 `lib/arm64-v8a/libtaInterface.so` of the V-OS corpus is the known case.
+
+**And if you are on the sopack in between, the one that skipped a library over `changed what
+'<sym>' resolves to` with two IDENTICAL tuples, that diagnosis was wrong too.** It looked like:
+
+```
+skipping lib/arm64-v8a/libloadTA.so: injecting the target changed what '__bss_start' resolves to
+  ((('ABS', 0, 0, 16, 1),) -> (('ABS', 0, 0, 16, 1),), expected (('ABS', 4096, 0, 16, 1),)
+   after a rebase of +4096) - dlsym() would fail on device
+```
+
+The before and after are the same tuple: nothing about that symbol changed. That guard applied the
+image's rebase to **every** symbol value, and a value that is not a section-relative address (an
+`SHN_ABS` symbol such as `__bss_start`) or that sits below the point LIEF inserted space at does
+not move. `__bss_start` is in almost every library, so this was never specific to `libloadTA.so`.
+The fix is in the packer - see §11f - and there is no configuration workaround; on the affected
+version the only way to protect the library was `libraries.include`-ing it, which turns the skip
+into a hard failure rather than a pass.
+
+**Either way the library was not corrupted - it shipped in CLEARTEXT.** Both of these were
+false skips under auto-select's fail-soft, so the pack exits 0, the original library is written
+back verbatim, and the entry is listed under `Skipped (selected but could not be injected - these
+ship in CLEARTEXT)` and in `report.json`'s `failed`. Nothing to undo; re-pack once the packer is
+fixed.
 
 ---
 

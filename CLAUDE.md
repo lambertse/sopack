@@ -975,17 +975,43 @@ would make precedence depend silently on insertion order.
   `test_apks/vsa/vsa.apk` (`libtaInterface.so`, whose table interleaves obfuscated V-OS imports
   with its exports) so index equality reported `'call_vm_loadTA' -> '_16923bf24c…L'` and skipped a
   library that was perfectly injectable. (2) It **rebases the image** when the appended segment
-  forces a relayout - measured +4096 on every defined and `SHN_ABS` `st_value`, on relocation
-  offsets and on the `.dynamic` tags, with undefined values staying 0, so absolute `st_value`
-  equality is wrong too. So the guard asserts the name **set**, then per-name
-  `(kind, st_value - delta, st_size, st_info, versym)`, then that `DT_HASH` still resolves every
-  name to its own index, then that no relocation changed which symbol it targets - and only
-  *warns* when the order moved with all four holding. That is strictly stronger than the old
-  check: the §11f desync garbles `st_name` reads into mid-string fragments, so it cannot survive
-  the name-set test. Do not re-tighten this to `_dynsym_names(a) == _dynsym_names(b)`.
+  forces a relayout - measured +4096 on the `.dynamic` tags and on relocation offsets, with
+  undefined values staying 0, so absolute `st_value` equality is wrong too. So the guard asserts
+  the name **set**, then that every value is explained by a **single** relayout of `delta`, then
+  that `DT_HASH` still resolves every name to its own index, then that no relocation changed which
+  symbol it targets - and only *warns* when the order moved with all four holding. That is
+  strictly stronger than the old check: the §11f desync garbles `st_name` reads into mid-string
+  fragments, so it cannot survive the name-set test. Do not re-tighten this to
+  `_dynsym_names(a) == _dynsym_names(b)`.
+  **Nor to a uniform `st_value + delta`, which is the SECOND false skip this guard has produced.**
+  That was the shape of check (2) and it refused `lib/arm64-v8a/libloadTA.so`, whose `__bss_start`
+  is `SHN_ABS` with value **0** and comes through a +4096 rebase still 0 - reported with a message
+  whose own before/after tuples were IDENTICAL
+  (`(('ABS', 0, 0, 16, 1),) -> (('ABS', 0, 0, 16, 1),), expected (('ABS', 4096, 0, 16, 1),)`).
+  A relayout inserts space at ONE point and moves what sits above it, and `st_value` is only a
+  section-relative address for a section-**defined** symbol - `SHN_ABS` means the value need not be
+  an address at all, and an undefined symbol's value names no location. So
+  `_assert_values_consistent_with_rebase` reads the shift **off the pair**: each value came through
+  unchanged or shifted by exactly `delta`, and among the DEF symbols the two groups **separate**
+  (nothing left behind above something that moved). The separation is what keeps the real defect
+  refused - a defined symbol whose section moved and whose value did not. `__bss_start` is
+  ubiquitous, so this was never one library's oddity. Check (4) still applies `delta` uniformly to
+  relocation offsets and **must stay that way**: with `delta` 4096 and entries 8 bytes apart both
+  `off` and `off + delta` legitimately exist in the after-table, so the pair-classification is
+  ambiguous there.
+  **The property to check any future edit of check (2) against: it accepts a strict SUPERSET of
+  what the uniform `+delta` accepted, so no library that packs today can stop packing.**
+  "Unchanged or `+delta`" relaxes "`+delta`, mandatory", and the separation can only fire when an
+  address-bearing value stayed put - which never happened in anything the uniform rule let
+  through. If a library that packed before starts being skipped, the code does not implement the
+  rule; re-derive rather than widening the message. Note also that `STT_TLS` symbols ARE
+  section-defined, so they land in the DEF bucket while their `st_value` is a TLS-block offset,
+  not an address - `_bounds_shift` filters them out of the separation explicitly.
   `tests/test_wbaes.py` pins both directions - a 2,991-symbol real `.so` that must be untouched,
-  the permuting library that must pack, and three mutations (stale `DT_HASH`, stale relocation
-  indices, pre-write `DT_STRTAB`) that must each refuse.
+  the permuting library that must pack, three mutations (stale `DT_HASH`, stale relocation
+  indices, pre-write `DT_STRTAB`) that must each refuse, and check (2)'s tolerance on synthesised
+  pairs (`ABS`-at-0 and a low `STT_TLS` offset accepted; a DEF left behind above one that moved, a
+  drift that is not `delta`, a moved undefined value, and a changed size or version each refused).
 
 - **The `.text` cipher must stay length-preserving.** `.text` ciphertext lives in the target's
   own section bytes, so the bulk cipher has to be a stream cipher. That is why wbaes mode does

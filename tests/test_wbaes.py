@@ -916,6 +916,153 @@ def test_strtab_desync_on_a_permuting_library_is_still_caught(tmp_path):
         _assert_equivalent(src, tmp_path / "out.so")
 
 
+# ---- a symbol the rebase does NOT move, and why that is not a defect -----------------
+# The commit that fixed the permutation above traded one false skip for another: it compared
+# `st_value` against a UNIFORM `val + delta`, and `lib/arm64-v8a/libloadTA.so` of the VSA corpus
+# carries `__bss_start` as SHN_ABS with value 0, which a +4096 rebase leaves at 0. The guard
+# demanded 4096 and skipped the library with a message whose own before/after tuples were equal:
+#   'injecting the target changed what '__bss_start' resolves to
+#    ((('ABS', 0, 0, 16, 1),) -> (('ABS', 0, 0, 16, 1),), expected (('ABS', 4096, 0, 16, 1),)'
+# These drive `_assert_values_consistent_with_rebase` directly, on synthesised pairs, because the
+# property is about the RULE and not about any one library or LIEF version - and because the two
+# false skips this file now guards against were both found on a corpus, one library at a time.
+
+_DEF, _ABS, _UND = elf_inject._SYM_DEF, elf_inject._SYM_ABS, elf_inject._SYM_UND
+
+
+def _ident(name, kind, size=0, info=16, ver=1):
+    """A `_paired_symbol_values` identity: everything about a record except its value."""
+    return (name, kind, size, info, ver)
+
+
+def _check(pairs, delta=4096):
+    elf_inject._assert_values_consistent_with_rebase(
+        pairs, delta, "TEST", "the test would be a lie")
+
+
+def test_abs_symbol_left_at_zero_by_a_rebase_is_accepted():
+    """The libloadTA.so regression, reduced: an ABS symbol at 0 comes through untouched while the
+    defined symbols all shift. Nothing an app can observe changed, so this must pass."""
+    _check([
+        (_ident("__bss_start", _ABS), 0, 0),
+        (_ident("Java_do_thing", _DEF, size=56), 0x1530, 0x1530 + 4096),
+        (_ident("call_vm_loadTA", _DEF, size=56), 0x2000, 0x2000 + 4096),
+        (_ident("dlopen", _UND), 0, 0),
+    ])
+
+
+def test_absolute_constant_above_the_shift_does_not_bound_the_rebase():
+    """An SHN_ABS value need not be an address at all, so a large absolute constant that stays put
+    must not be read as a defined symbol left behind above one that moved. Scoping rule 2 to DEF
+    is what makes this pass; a kind-blind separation test would reject it."""
+    _check([
+        (_ident("_VERSION_CONSTANT", _ABS), 0x7FFFFFFF, 0x7FFFFFFF),
+        (_ident("Java_do_thing", _DEF, size=56), 0x1530, 0x1530 + 4096),
+    ])
+
+
+def test_a_tls_symbol_does_not_bound_the_rebase_either():
+    """`STT_TLS` is section-defined - `st_shndx` points at `.tdata`/`.tbss` - so it lands in the
+    DEF bucket, but its `st_value` is an offset into the TLS block, not an address. A small offset
+    that stays put must not read as a defined symbol left behind above one that moved."""
+    _check([
+        (_ident("my_tls_var", _DEF, size=8, info=0x16), 0x8, 0x8),   # STB_GLOBAL | STT_TLS
+        (_ident("Java_do_thing", _DEF, size=56, info=0x12), 0x1530, 0x1530 + 4096),
+    ])
+
+
+def test_a_defined_symbol_left_behind_above_one_that_moved_is_refused():
+    """The defect check (2) exists for: a defined symbol whose section moved and whose value did
+    not. dlsym would hand out the pre-rebase address. No single relayout explains it."""
+    with pytest.raises(InjectError, match="no single relayout"):
+        _check([
+            (_ident("low", _DEF, size=8), 0x1000, 0x1000 + 4096),
+            (_ident("high_but_stale", _DEF, size=8), 0x9000, 0x9000),
+        ])
+
+
+def test_a_value_that_moved_by_something_else_is_refused():
+    """Neither nothing nor the measured rebase: the image is not a uniform relayout of its input
+    and no tolerance here should cover it."""
+    with pytest.raises(InjectError, match="which is neither nothing nor"):
+        _check([(_ident("drifted", _DEF, size=8), 0x1000, 0x1008)])
+
+
+def test_an_undefined_symbol_may_not_move_at_all():
+    """An UND `st_value` names no location, so a rebase has nothing to apply to it. It is excluded
+    from the separation test, NOT from the unchanged-or-delta rule."""
+    with pytest.raises(InjectError, match="which is neither nothing nor"):
+        _check([(_ident("dlopen", _UND), 0, 4096)])
+
+
+def test_nothing_moving_under_a_nonzero_delta_is_accepted():
+    """LIEF may move the dynamic tables (which is where `delta` is measured) without moving the
+    content the symbols name. Every value unchanged is then correct, and the uniform model
+    rejected every symbol in the library."""
+    _check([
+        (_ident("Java_do_thing", _DEF, size=56), 0x1530, 0x1530),
+        (_ident("__bss_start", _ABS), 0x9000, 0x9000),
+    ])
+
+
+def test_a_changed_size_or_binding_is_still_refused():
+    """`_paired_symbol_values` pairs on everything but the value, so a record whose size, kind,
+    binding or version changed cannot be paired at all - so it cannot pass as unchanged."""
+    ent_in = [(1, "Java_do_thing", _DEF, 0x1530, 56, 18, 1)]
+    ent_out = [(1, "Java_do_thing", _DEF, 0x1530 + 4096, 8, 18, 1)]
+    with pytest.raises(InjectError, match="kind, size, binding or version"):
+        elf_inject._paired_symbol_values(ent_in, ent_out, "TEST", "the test would be a lie")
+
+
+def test_a_versioned_name_is_paired_entry_by_entry():
+    """Symbol versioning repeats a name, so the guard groups by identity and pairs the values in
+    sorted order. Two records that both shift is fine; one shifting and one drifting is not."""
+    two = [(_ident("memcpy", _DEF, size=8, ver=2), 0x1000, 0x1000 + 4096),
+           (_ident("memcpy", _DEF, size=8, ver=3), 0x2000, 0x2000 + 4096)]
+    _check(two)
+    ent_in = [(1, "memcpy", _DEF, 0x1000, 8, 18, 2), (2, "memcpy", _DEF, 0x2000, 8, 18, 2)]
+    ent_out = [(1, "memcpy", _DEF, 0x1000 + 4096, 8, 18, 2), (2, "memcpy", _DEF, 0x2008, 8, 18, 2)]
+    with pytest.raises(InjectError, match="which is neither nothing nor"):
+        _check(elf_inject._paired_symbol_values(ent_in, ent_out, "TEST", "lie"))
+
+
+def test_the_guard_accepts_an_abs_zero_symbol_on_a_real_lief_write(tmp_path):
+    """The same regression at the file level: take the pinned permuting library, run the LIEF write
+    the wbaes path performs, and force ONE dynamic symbol to SHN_ABS/0 in BOTH files - the shape
+    `libloadTA.so` arrives in. Patching both sides rather than relying on LIEF to leave an ABS
+    value alone keeps this deterministic across LIEF versions.
+
+    Skips when the write did not rebase the image, because there is then no delta for the old
+    uniform model to have demanded and the case above carries the invariant instead."""
+    corpus = _corpus()
+    src = corpus.extract(*_PERMUTING, tmp_path)
+    out = _lief_rewrite(src, tmp_path / "out.so")
+    delta = elf_inject._rebase_delta(str(src), str(out))
+    if delta == 0:
+        pytest.skip("this LIEF write did not rebase the image, so the ABS/0 case is vacuous here")
+
+    # Any defined symbol will do; take the highest-addressed one, which is certainly above the
+    # point space was inserted at and so certainly moved before the mutation. Turning THAT into
+    # ABS/0 is the strongest form of the case: the one value that stays put is the one that was
+    # furthest above everything else.
+    ent = elf_inject._dynsym_entries(str(src))
+    name = max((e for e in ent if e[2] == _DEF), key=lambda e: e[3])[1]
+    if sum(1 for _i, n, *_ in ent if n == name) != 1:
+        pytest.skip(f"{name!r} is repeated in .dynsym; the two files could pick different records")
+    for path in (src, out):
+        idx = next(i for i, n, *_ in elf_inject._dynsym_entries(str(path)) if n == name)
+        v = elf_inject._LoaderView(str(path))
+        buf = bytearray(v.buf)
+        base = v.vaddr_to_off(v.tags[elf_inject._DT_SYMTAB]) + idx * 24
+        struct.pack_into("<H", buf, base + 6, elf_inject._SHN_ABS)
+        struct.pack_into("<Q", buf, base + 8, 0)
+        pathlib.Path(path).write_bytes(bytes(buf))
+
+    assert elf_inject._dynsym_resolution(str(out))[name][0][:2] == (_ABS, 0), \
+        "the mutation did not land - this test would pass for the wrong reason"
+    _assert_equivalent(src, out)                     # must not raise
+
+
 @_needs_wb_keygen
 def test_permuting_library_packs_under_wbaes(monkeypatch, tmp_path):
     """End to end: the library that used to be skipped now injects, and comes out resolving

@@ -385,14 +385,18 @@ def _exported_dynsyms(path: str) -> list[str]:
 #     libraries permutes, because its table interleaves imports with exports (an obfuscator
 #     artifact). Positional comparison read that as "'call_vm_loadTA' -> '_16923bf24c…L'" and
 #     skipped the library, leaving it in cleartext.
-#   * it REBASES the whole image when the appended segment forces a relayout - measured +4096 on
-#     every defined and SHN_ABS symbol value, on relocation offsets, and on the .dynamic tags,
-#     with undefined values staying 0. So absolute st_value equality is wrong too.
+#   * it REBASES the image when the appended segment forces a relayout - measured on that library
+#     as +4096 on the .dynamic tags, on relocation offsets, and on the symbol values that name an
+#     address ABOVE the point space was inserted at. NOT on every value: one measured on
+#     `libloadTA.so` of the same corpus is an SHN_ABS `__bss_start` at 0, which stays 0. So
+#     absolute st_value equality is wrong, and so is a uniform `+delta` - see
+#     `_assert_values_consistent_with_rebase` for the rule that replaced both.
 # What bionic actually needs is that every name still resolves to the SAME symbol, that DT_HASH
 # still finds it, and that no relocation changed which symbol it targets. That is what these read
 # and `_assert_dynsyms_equivalent` asserts - strictly stronger than the old check (§11f's desync
 # garbles st_name reads, so the NAME SET cannot survive it), just not order-sensitive.
 _SYM_UND, _SYM_ABS, _SYM_DEF = "UND", "ABS", "DEF"
+_STT_TLS = 6            # ELF32_ST_TYPE: st_value is an offset into the TLS block, not an address
 
 
 def _dynsym_entries(path: str) -> list[tuple[int, str, str, int, int, int, int | None]]:
@@ -551,9 +555,122 @@ def _rebase_delta(in_path: str, out_path: str) -> int:
     return next(iter(deltas.values()))
 
 
+# ---- what a rebase may and may not do to a symbol VALUE ---------------------------
+# `val + delta` for every non-UND symbol was the first model and it is WRONG, in the same shape
+# as the positional name comparison it replaced: it asserts something LIEF is not obliged to do,
+# and skips an injectable library when LIEF does not do it. A relayout inserts space at ONE point
+# in the image and moves what sits above it, so a value that comes through UNCHANGED is not
+# evidence of a defect - it is evidence the value sits below that point, or is not an address in
+# the image at all. Both happen:
+#   * `SHN_ABS` says the value is not relative to any section, so it need not be an address.
+#     Measured on `lib/arm64-v8a/libloadTA.so` of the VSA corpus: `__bss_start` is ABS with value
+#     0 and comes through a +4096 rebase still 0. The uniform model demanded 4096 and refused the
+#     library with a message whose own before/after tuples were IDENTICAL -
+#     `(('ABS', 0, 0, 16, 1),) -> (('ABS', 0, 0, 16, 1),), expected (('ABS', 4096, 0, 16, 1),)`.
+#     A check whose failure text prints two equal tuples is describing its model, not a defect.
+#   * a section-defined symbol that happens to sit below the insertion point does not move either.
+# So the shift is read OFF THE PAIR rather than assumed: every value must come through either
+# unchanged or shifted by exactly `delta`, and among the SECTION-DEFINED symbols - the only ones
+# whose value is definitionally an address - the two groups must SEPARATE: nothing left behind at
+# an address above something that moved. That still refuses the defect this check exists for (a
+# defined symbol whose section moved and whose value did not: it lands above something that moved,
+# so the separation breaks), and it no longer invents one out of a symbol nobody rebased.
+#
+# Note the asymmetry with check (4), which still applies `delta` uniformly to relocation offsets.
+# That is deliberate: those offsets are `.data.rel.ro`/`.got` addresses, always well above any
+# insertion point, and the same pair-classification cannot be done there without ambiguity (with
+# delta=4096 and entries 8 bytes apart, both `off` and `off + delta` legitimately exist in the
+# after-table). Do not "harmonise" it on speculation - that is exactly how this bug was written.
+
+
+def _paired_symbol_values(ent_in, ent_out, what: str,
+                          consequence: str) -> list[tuple[tuple, int, int]]:
+    """`[(identity, value_before, value_after)]` for every dynamic symbol record across a write.
+
+    `identity` is the whole record EXCEPT the value - `(name, kind, st_size, st_info, versym)` -
+    so a name that symbol versioning legitimately repeats is checked entry by entry instead of as
+    an unordered blob. Within one identity the values are paired in SORTED order, which is the only
+    pairing a relayout can produce: shifting the addresses above a point and leaving the rest never
+    reorders two of them.
+
+    Refuses if the identities themselves do not line up, which no rebase can explain."""
+    def grouped(entries):
+        g: dict[tuple, list[int]] = {}
+        for _i, name, kind, val, size, info, ver in entries:
+            g.setdefault((name, kind, size, info, ver), []).append(val)
+        return {k: sorted(v) for k, v in g.items()}
+
+    a, b = grouped(ent_in), grouped(ent_out)
+    if set(a) != set(b) or any(len(a[k]) != len(b[k]) for k in a):
+        lost = sorted(set(a) - set(b), key=repr)
+        gained = sorted(set(b) - set(a), key=repr)
+        if lost and gained:
+            detail = f"e.g. {lost[0]} -> {gained[0]}"
+        elif lost or gained:
+            detail = f"lost {lost[:2]}, gained {gained[:2]}"
+        else:
+            k = next(k for k in a if len(a[k]) != len(b[k]))
+            detail = f"{k[0]!r} has {len(a[k])} records, now {len(b[k])}"
+        raise InjectError(
+            f"{what} changed a dynamic symbol's kind, size, binding or version ({detail}) - "
+            f"{consequence}")
+    return [(k, x, y) for k in sorted(a, key=repr) for x, y in zip(a[k], b[k])]
+
+
+def _assert_values_consistent_with_rebase(pairs, delta: int, what: str,
+                                          consequence: str) -> None:
+    """Refuse `pairs` unless every value is explained by a single relayout of `delta` bytes.
+
+    Two rules, both read off the data rather than assumed (see the comment above):
+
+    1. every value came through either unchanged or shifted by exactly `delta`. `delta == 0`
+       collapses this to plain equality, which is what it should be.
+    2. among SECTION-DEFINED symbols, everything that stayed put sits below everything that moved.
+       One insertion point moves everything above it and nothing below it, so a defined symbol
+       left behind above one that moved is the real defect - its section moved and it did not, and
+       dlsym now hands out the wrong address.
+
+    Rule 2 is scoped to the symbols whose value is definitionally a section-relative ADDRESS, and
+    that is narrower than "defined": `SHN_ABS` says the value need not be an address at all (an
+    absolute constant would bound an insertion point it has nothing to do with), an `UND` value
+    names no location, and an `STT_TLS` value is an offset into the TLS block - section-defined,
+    so it lands in `DEF`, but not an address. All three still have to satisfy rule 1, which is all
+    that can be asked of them."""
+    stayed, moved = [], []
+    for ident, before, after in pairs:
+        if after == before:
+            stayed.append((ident, before))
+        elif ident[1] != _SYM_UND and after == before + delta:
+            moved.append((ident, before))
+        else:
+            expected = f"the {delta:+d} the image was rebased by" if delta else \
+                       "0 - the image was not rebased"
+            raise InjectError(
+                f"{what} moved {ident[0]!r} by {after - before:+d} "
+                f"(0x{before:x} -> 0x{after:x}), which is neither nothing nor {expected} - "
+                f"{consequence}")
+
+    # `_bounds_shift`, not `kind == DEF`: see the docstring. Widening this can only invent false
+    # skips, which is what the two commits before this one did.
+    def _bounds_shift(ident):
+        return ident[1] == _SYM_DEF and (ident[3] & 0xF) != _STT_TLS
+
+    floor = [(i, v) for i, v in stayed if _bounds_shift(i)]
+    ceiling = [(i, v) for i, v in moved if _bounds_shift(i)]
+    if not (floor and ceiling):
+        return
+    hi_ident, hi = max(floor, key=lambda t: t[1])
+    lo_ident, lo = min(ceiling, key=lambda t: t[1])
+    if hi >= lo:
+        raise InjectError(
+            f"{what} moved {lo_ident[0]!r} (0x{lo:x} -> 0x{lo + delta:x}) but left "
+            f"{hi_ident[0]!r} at 0x{hi:x} - no single relayout moves the lower address and not "
+            f"the higher one, so one of the two now resolves to the wrong place and {consequence}")
+
+
 def _assert_dynsyms_equivalent(in_path: str, out_path: str, what: str, consequence: str) -> None:
     """Refuse `out_path` unless every dynamic symbol still resolves to the same thing it did in
-    `in_path`, allowing for a uniform rebase and a `.dynsym` permutation.
+    `in_path`, allowing for a rebase of the image and a `.dynsym` permutation.
 
     Four checks, ordered so the first failure names the actual defect; then a warning if the order
     moved but nothing else did. See docs/technical/ARCHITECTURE.md §11f."""
@@ -573,17 +690,10 @@ def _assert_dynsyms_equivalent(in_path: str, out_path: str, what: str, consequen
             f"{what} changed the dynamic symbol names ({detail}) - DT_STRTAB and the .dynsym "
             f"offsets are out of sync, so {consequence}")
 
-    # (2) What each name resolves to, under the measured rebase.
-    def shifted(entries):
-        return tuple(sorted((kind, val + (0 if kind == _SYM_UND else delta), size, info, ver)
-                            for kind, val, size, info, ver in entries))
-
-    for name in sorted(before):
-        want = shifted(before[name])
-        if after[name] != want:
-            raise InjectError(
-                f"{what} changed what {name!r} resolves to ({before[name]} -> {after[name]}, "
-                f"expected {want} after a rebase of {delta:+d}) - {consequence}")
+    # (2) What each name resolves to, under the measured rebase. NOT `val + delta` everywhere -
+    # see the comment above `_paired_symbol_values` for the library that cost.
+    _assert_values_consistent_with_rebase(
+        _paired_symbol_values(ent_in, ent_out, what, consequence), delta, what, consequence)
 
     # (3) DT_HASH must still find every name at its own index: dlsym walks those chains, so a
     # permuted .dynsym against stale buckets resolves nothing even though the table is intact.

@@ -781,29 +781,86 @@ The first version of the guard compared the name lists **positionally**, and tha
   section's diagnosis - `DT_STRTAB` and the offsets out of sync - which was **false**. The library
   was injectable; auto-select's fail-soft shipped it in cleartext instead.
 * it **rebases the image** when the appended segment forces a relayout. Measured on that library:
-  `.text` `0x1530 -> 0x2530`, every defined and `SHN_ABS` `st_value` +4096, relocation offsets and
-  `.dynamic` tags likewise, undefined values staying 0. So absolute `st_value` equality is not an
-  invariant either. (Check (a) of `_self_verify_wbaes` tolerates the rebase only because
-  `_inject_wbaes` reads `text_rva` *after* `b.add(seg)`, and the same value is what the helper's
-  region records.)
+  `.text` `0x1530 -> 0x2530`, `.dynamic` tags and relocation offsets +4096, undefined values
+  staying 0. So absolute `st_value` equality is not an invariant either. (Check (a) of
+  `_self_verify_wbaes` tolerates the rebase only because `_inject_wbaes` reads `text_rva` *after*
+  `b.add(seg)`, and the same value is what the helper's region records.)
+
+#### What that guard may NOT assert either: a UNIFORM `+delta` on every value
+
+The second version of the guard replaced the positional name comparison with a value comparison,
+and it made the mirror-image mistake - it asserted a model instead of a property, and skipped a
+different injectable library. `lib/arm64-v8a/libloadTA.so` of the same corpus carries `__bss_start`
+as `SHN_ABS` with value **0**, and a +4096 rebase leaves it at 0:
+
+```
+skipping lib/arm64-v8a/libloadTA.so: injecting the target changed what '__bss_start' resolves to
+  ((('ABS', 0, 0, 16, 1),) -> (('ABS', 0, 0, 16, 1),), expected (('ABS', 4096, 0, 16, 1),)
+   after a rebase of +4096) - dlsym() would fail on device
+```
+
+The before and after tuples in that message are **identical**. A check whose failure text prints
+two equal tuples is describing its own model, not a defect. Two things were wrong with the model:
+
+* a relayout inserts space at **one point** in the image and moves what sits above it. A value
+  below that point correctly does not move, so "unchanged" is not evidence of anything.
+* `st_value` is only a section-relative address for a **section-defined** symbol, and even
+  "defined" is too wide. `SHN_ABS` says the opposite - the value need not be an address at all, so
+  an absolute constant must not bound an insertion point it has nothing to do with - an undefined
+  symbol's value names no location, and an **`STT_TLS`** value is an offset into the TLS block.
+  That last one is the trap: TLS symbols *are* section-defined (`st_shndx` points at
+  `.tdata`/`.tbss`), so they land in the `DEF` bucket and would bound the separation. They are
+  filtered explicitly (`_bounds_shift`). None has been observed in this corpus; the filter is
+  there because the cost of being wrong is another false skip.
+
+`__bss_start` is ubiquitous, so this is not a one-library oddity - it trips wherever the value
+happens to sit below the insertion point. So the rule is now read **off the pair** rather than
+assumed (`_assert_values_consistent_with_rebase`), and the property that replaced it is stated in
+rule 2 below.
 
 So `_assert_dynsyms_equivalent` asserts what bionic actually depends on, in this order:
 
 1. the dynamic symbol **name set** is unchanged - this is where the desync above lands, since
    mid-string reads cannot reproduce the same set of names;
-2. per name, `(kind, st_value - delta, st_size, st_info, versym)` is unchanged, where `delta` is
-   the rebase read off `DT_SYMTAB`/`DT_HASH` (never `DT_STRTAB`, which this mode repoints on
-   purpose);
+2. every value is explained by a **single** relayout of `delta` bytes, where `delta` is the rebase
+   read off `DT_SYMTAB`/`DT_HASH` (never `DT_STRTAB`, which this mode repoints on purpose): each
+   value came through either unchanged or shifted by exactly `delta`, and among the
+   **section-defined** symbols the two groups **separate** - nothing left behind at an address
+   above something that moved. Records are paired on `(name, kind, st_size, st_info, versym)`, so
+   a name that symbol versioning repeats is checked entry by entry and a changed size, binding or
+   version cannot pass as "unchanged". The separation is what still refuses the real defect - a
+   defined symbol whose section moved and whose value did not, which `dlsym` would then resolve to
+   the pre-rebase address;
 3. `DT_HASH` still resolves every name to its own index - `dlsym` walks those chains, so a
    permutation against stale buckets finds nothing even though the table is intact;
 4. no relocation changed which symbol it targets, comparing symbol-bearing entries only
    (`R_*_RELATIVE` names no symbol and its addend is rebased, so including it would only invent
    false failures).
 
+**Rule 2 accepts a strict superset of what the uniform `+delta` accepted, and that is the property
+to check any future edit against.** "Unchanged or `+delta`" relaxes "`+delta`, mandatory"; and the
+separation test can only fire when some address-bearing value stayed put, which by definition never
+happened in anything the uniform rule let through (`floor` is empty, so it short-circuits).
+Likewise, if the old per-name tuple comparison passed then the identity multisets
+`_paired_symbol_values` groups on necessarily match. So **no library that packed under the uniform
+rule can stop packing** - which is exactly what the two attempts before this one could not say,
+each having traded one false skip for another. If a library that packed before starts being
+skipped, the code does not implement this rule; re-derive rather than widening the message.
+
 A permutation that passes all four is **warned about**, not accepted silently. The combination is
 strictly stronger than the original positional check, and `tests/test_wbaes.py` pins both
-directions: the permuting library must pack, and three mutations of it - stale `DT_HASH`, stale
-relocation symbol indices, and a pre-write `DT_STRTAB` - must each refuse.
+directions: the permuting library must pack, three mutations of it - stale `DT_HASH`, stale
+relocation symbol indices, and a pre-write `DT_STRTAB` - must each refuse, and rule 2's own
+tolerance is pinned on synthesised pairs (an `ABS`-at-0 that stays put is accepted; a defined
+symbol left behind above one that moved, a value that drifted by anything other than `delta`, a
+moved undefined value, and a changed size or version are each refused).
+
+Note that rule 4 still applies `delta` **uniformly** to relocation offsets, unlike rule 2. That is
+deliberate, not an oversight: those offsets are `.data.rel.ro`/`.got` addresses, always well above
+any insertion point, and the pair-classification rule 2 uses cannot be applied there without
+ambiguity - with `delta` 4096 and entries 8 bytes apart, both `off` and `off + delta` legitimately
+exist in the after-table, so there is no way to tell which of the two a given before-entry became.
+Harmonising it on speculation is exactly how the `libloadTA.so` skip was written; do not.
 
 See [`WBAES.md`](./WBAES.md) Part II for the six-phase verification
 procedure, including a host round-trip that exercises every one of these contracts without a
