@@ -467,6 +467,35 @@ excluded whatever the config says. Anything outside `abis:` is listed as `abi no
 
 ---
 
+## Skip: `injecting the target changed the dynamic symbol names` / `changed what '<sym>' resolves to`
+
+Both come from `_assert_dynsyms_equivalent`, the `cipher: wbaes` guard that refuses to ship a
+library whose `dlsym` behaviour the injection changed. Which message you get says what happened,
+and they are not the same problem.
+
+**`changed the dynamic symbol names (e.g. 'x' -> 'y')`** - the set of dynamic symbol names is not
+the same before and after. This is the shipped bug of
+[`technical/ARCHITECTURE.md`](./technical/ARCHITECTURE.md) §11f: `DT_STRTAB` points at a copy of
+`.dynstr` whose layout does not match the `st_name` offsets in `.dynsym`, so names resolve
+mid-string. The library would load and then return `NULL` from `dlsym`, which is why the packer
+refuses. There is nothing to configure - it means the write went wrong, so file it with the
+`report.json` from the run rather than working around it.
+
+**`changed what '<sym>' resolves to`, `left DT_HASH unable to resolve ...`, or `changed the symbol
+a relocation targets`** - the names survived, but a symbol moved to a different address/size, the
+hash chains no longer find it, or a relocation now points at a different symbol. Same conclusion:
+a broken write, not a configuration problem.
+
+**A `WARNING: ... came out with .dynsym in a different ORDER` is not a failure.** LIEF normalises
+`.dynsym` (undefined entries first) when it rebuilds a library, and on a table that interleaves
+imports with exports the list genuinely moves. Every name still resolves identically, so the pack
+continues. If you are on an older sopack that *skipped* such a library - reporting
+`'call_vm_loadTA' -> '_16923bf24c…L'` with the `DT_STRTAB ... out of sync` wording - that
+diagnosis was wrong: the guard compared index order, and the fix is in the packer, not the app.
+`lib/arm64-v8a/libtaInterface.so` of the V-OS corpus is the known case.
+
+---
+
 ## `invalid linker name in argument '-fuse-ld=lld'` when building stubs
 
 Your `ANDROID_NDK_HOME` points at something that isn't a real NDK (e.g. a version like

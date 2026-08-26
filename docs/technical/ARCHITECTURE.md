@@ -762,10 +762,48 @@ bytes - that distinction is what located this.
 
 Two lessons are now enforced in code. The string table must be read back **from the written
 file** via `DT_STRTAB` (`_effective_strtab`), never from the pre-write section. And
-`_self_verify_wbaes` compares every dynamic symbol name before and after and refuses to pack on
-any change, resolving them the way bionic does (`_LoaderView`: program headers + `.dynamic`, never
-section headers, since in this mode the `.dynstr` section header and `DT_STRTAB` legitimately
-point at different bytes).
+`_self_verify_wbaes` refuses to pack if any dynamic symbol stops resolving to the same thing,
+resolving them the way bionic does (`_LoaderView`: program headers + `.dynamic`, never section
+headers, since in this mode the `.dynstr` section header and `DT_STRTAB` legitimately point at
+different bytes).
+
+#### What that guard may NOT assert: `.dynsym` index order
+
+The first version of the guard compared the name lists **positionally**, and that was too strong.
+`write()` does two more things that are legitimate, and each one moves the list:
+
+* it **normalises `.dynsym`**, putting undefined entries ahead of defined ones. Most libraries are
+  already in that shape, so nothing moves. Measured across all 24 arm64 libraries of the pinned
+  `test_apks/vsa/vsa.apk`: exactly one is not - `libtaInterface.so`, whose table interleaves nine
+  obfuscated V-OS imports (`_16923bf24c2b…L`, resolved out of `libvosWrapperEx.so`) with its own
+  exports. Positional comparison read that permutation as
+  `'call_vm_loadTA' -> '_16923bf24c2b4257b579fcc6bffd0844135199901L'` and reported it with this
+  section's diagnosis - `DT_STRTAB` and the offsets out of sync - which was **false**. The library
+  was injectable; auto-select's fail-soft shipped it in cleartext instead.
+* it **rebases the image** when the appended segment forces a relayout. Measured on that library:
+  `.text` `0x1530 -> 0x2530`, every defined and `SHN_ABS` `st_value` +4096, relocation offsets and
+  `.dynamic` tags likewise, undefined values staying 0. So absolute `st_value` equality is not an
+  invariant either. (Check (a) of `_self_verify_wbaes` tolerates the rebase only because
+  `_inject_wbaes` reads `text_rva` *after* `b.add(seg)`, and the same value is what the helper's
+  region records.)
+
+So `_assert_dynsyms_equivalent` asserts what bionic actually depends on, in this order:
+
+1. the dynamic symbol **name set** is unchanged - this is where the desync above lands, since
+   mid-string reads cannot reproduce the same set of names;
+2. per name, `(kind, st_value - delta, st_size, st_info, versym)` is unchanged, where `delta` is
+   the rebase read off `DT_SYMTAB`/`DT_HASH` (never `DT_STRTAB`, which this mode repoints on
+   purpose);
+3. `DT_HASH` still resolves every name to its own index - `dlsym` walks those chains, so a
+   permutation against stale buckets finds nothing even though the table is intact;
+4. no relocation changed which symbol it targets, comparing symbol-bearing entries only
+   (`R_*_RELATIVE` names no symbol and its addend is rebased, so including it would only invent
+   false failures).
+
+A permutation that passes all four is **warned about**, not accepted silently. The combination is
+strictly stronger than the original positional check, and `tests/test_wbaes.py` pins both
+directions: the permuting library must pack, and three mutations of it - stale `DT_HASH`, stale
+relocation symbol indices, and a pre-write `DT_STRTAB` - must each refuse.
 
 See [`WBAES.md`](./WBAES.md) Part II for the six-phase verification
 procedure, including a host round-trip that exercises every one of these contracts without a

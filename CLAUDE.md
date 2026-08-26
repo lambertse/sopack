@@ -957,20 +957,35 @@ would make precedence depend silently on insertion order.
   exports nothing (precisely the helper skeleton) the bucket array is empty and the walk reads
   past it - it reported 10 symbols for a 20-symbol `.so` and hid three unresolved `wbc_*`.
 
-- **An injection must never change the target's dynamic symbol names.** `cipher: wbaes`
-  supersedes `.dynstr` with an appended copy and repoints `DT_STRTAB` at it, so the copy has to
-  be the table `.dynsym`'s `st_name` offsets actually index. **LIEF rebuilds `.dynstr` with the
-  strings sorted during `write()` and rewrites every `st_name` to match**, so a copy taken
-  *before* the write desynchronises every offset: names then resolve mid-string and `dlsym`
-  returns NULL. This shipped once - Flutter got null Dart snapshot pointers and SIGSEGV'd in
-  `performNativeAttach`, ~1 s after launch, with nothing pointing at the packer. Therefore:
-  read the table with `_effective_strtab()` **after** `binary.write()` (never from
-  `get_section(".dynstr").content`), and `_self_verify_wbaes` compares `_dynsym_names()` of
-  input vs output and refuses to pack on any difference. Resolve symbols the way bionic does
-  (`DT_SYMTAB`/`DT_STRTAB`/`DT_HASH` via `_LoaderView`), never via section headers - the two
-  legitimately disagree in this mode. `tests/test_wbaes.py` pins it against a 2,991-symbol
-  real `.so`; a fixture whose symbol order already matches alphabetical order would not
-  detect the bug.
+- **An injection must never change what a dynamic symbol RESOLVES TO - which is not the same as
+  never changing the `.dynsym` list.** `cipher: wbaes` supersedes `.dynstr` with an appended copy
+  and repoints `DT_STRTAB` at it, so the copy has to be the table `.dynsym`'s `st_name` offsets
+  actually index. **LIEF rebuilds `.dynstr` with the strings sorted during `write()` and rewrites
+  every `st_name` to match**, so a copy taken *before* the write desynchronises every offset:
+  names then resolve mid-string and `dlsym` returns NULL. This shipped once - Flutter got null
+  Dart snapshot pointers and SIGSEGV'd in `performNativeAttach`, ~1 s after launch, with nothing
+  pointing at the packer. Therefore: read the table with `_effective_strtab()` **after**
+  `binary.write()` (never from `get_section(".dynstr").content`), and resolve symbols the way
+  bionic does (`DT_SYMTAB`/`DT_STRTAB`/`DT_HASH` via `_LoaderView`), never via section headers -
+  the two legitimately disagree in this mode.
+  **The guard is `_assert_dynsyms_equivalent`, and it is deliberately NOT a positional
+  comparison.** It was one, and that cost coverage: LIEF's `write()` does two further things that
+  are legitimate and both move the list. (1) It **normalises `.dynsym`**, undefined entries ahead
+  of defined ones - measured, exactly 1 of the 24 arm64 libraries in the pinned
+  `test_apks/vsa/vsa.apk` (`libtaInterface.so`, whose table interleaves obfuscated V-OS imports
+  with its exports) so index equality reported `'call_vm_loadTA' -> '_16923bf24c…L'` and skipped a
+  library that was perfectly injectable. (2) It **rebases the image** when the appended segment
+  forces a relayout - measured +4096 on every defined and `SHN_ABS` `st_value`, on relocation
+  offsets and on the `.dynamic` tags, with undefined values staying 0, so absolute `st_value`
+  equality is wrong too. So the guard asserts the name **set**, then per-name
+  `(kind, st_value - delta, st_size, st_info, versym)`, then that `DT_HASH` still resolves every
+  name to its own index, then that no relocation changed which symbol it targets - and only
+  *warns* when the order moved with all four holding. That is strictly stronger than the old
+  check: the §11f desync garbles `st_name` reads into mid-string fragments, so it cannot survive
+  the name-set test. Do not re-tighten this to `_dynsym_names(a) == _dynsym_names(b)`.
+  `tests/test_wbaes.py` pins both directions - a 2,991-symbol real `.so` that must be untouched,
+  the permuting library that must pack, and three mutations (stale `DT_HASH`, stale relocation
+  indices, pre-write `DT_STRTAB`) that must each refuse.
 
 - **The `.text` cipher must stay length-preserving.** `.text` ciphertext lives in the target's
   own section bytes, so the bulk cipher has to be a stream cipher. That is why wbaes mode does

@@ -751,3 +751,181 @@ def test_emitted_provider_keeps_its_soname_and_region(monkeypatch, tmp_path):
     # and a target-region read must refuse it rather than parse garbage
     with pytest.raises(InjectError, match="could not find a region"):
         _extract_region(str(out))
+
+
+# ---- a library LIEF PERMUTES, and what the guard must do about it ---------------------
+# The positional form of the guard above skipped `libtaInterface.so` of the pinned VSA corpus,
+# reporting "'call_vm_loadTA' -> '_16923bf24c…L' - DT_STRTAB and the .dynsym offsets are out of
+# sync". They were not: LIEF normalises `.dynsym` (undefined entries first) on write, and this
+# library's table interleaves imports with exports, so the LIST moves while every name still
+# resolves to the same symbol. Measured: 1 of that APK's 24 arm64 libraries does this.
+#
+# These tests need no wb_keygen: they drive `_assert_dynsyms_equivalent` across the same LIEF
+# write the wbaes path performs, so they run on a clean checkout. The gated test below covers the
+# real injection.
+
+_PERMUTING = ("test_apks/vsa/vsa.apk", "lib/arm64-v8a/libtaInterface.so")
+
+
+def _corpus():
+    """The pinned-corpus harness. It is newer than these tests' surroundings, so a checkout that
+    predates `tests/oracle/` would otherwise fail four tests with a ModuleNotFoundError that says
+    nothing about the remedy. `SOPACK_REQUIRE_CORPUS=1` turns the skip back into a failure, the
+    same switch `tests/oracle/corpus.py` uses for an absent corpus file."""
+    try:
+        from tests.oracle import corpus
+    except ModuleNotFoundError:
+        if os.environ.get("SOPACK_REQUIRE_CORPUS") == "1":
+            pytest.fail("tests/oracle/ is missing (SOPACK_REQUIRE_CORPUS=1)")
+        pytest.skip("needs the tests/oracle/ pinned-corpus harness")
+    return corpus
+
+
+def _lief_rewrite(src, dst):
+    """The write `_inject_wbaes` performs, reduced to the part that reshuffles the tables:
+    append a 16 KB-aligned read-only segment and let LIEF rebuild."""
+    b = lief.parse(str(src))
+    seg = lief.ELF.Segment()
+    seg.type = elf_inject._seg_type_load()
+    seg.flags = elf_inject._seg_flags_r()
+    seg.alignment = elf_inject.SEGMENT_ALIGN
+    seg.content = [0] * 8192
+    b.add(seg)
+    b.write(str(dst))
+    return dst
+
+
+def _one_und_and_def(path):
+    """An (undefined, defined) pair of `.dynsym` indices, for the swap mutations below."""
+    ent = elf_inject._dynsym_entries(str(path))
+    und = next(i for i, _n, kind, *_ in ent if kind == elf_inject._SYM_UND)
+    dfn = next(i for i, _n, kind, *_ in ent if kind == elf_inject._SYM_DEF)
+    return und, dfn
+
+
+def _swap_dynsyms(path, i, j, fix_versym=False, fix_hash=False):
+    """Swap two `.dynsym` records in place - the shape of a permutation whose fixups were
+    forgotten. `fix_versym`/`fix_hash` restore the tables a real permuter would have rebuilt,
+    so a test can isolate which guard fires."""
+    v = elf_inject._LoaderView(str(path))
+    buf = bytearray(v.buf)
+    symtab = v.vaddr_to_off(v.tags[elf_inject._DT_SYMTAB])
+    ent = 24 if v.is64 else 16
+    a, b = symtab + i * ent, symtab + j * ent
+    buf[a:a + ent], buf[b:b + ent] = bytes(buf[b:b + ent]), bytes(buf[a:a + ent])
+    if fix_versym and elf_inject._DT_VERSYM in v.tags:
+        vo = v.vaddr_to_off(v.tags[elf_inject._DT_VERSYM])
+        pa, pb = vo + 2 * i, vo + 2 * j
+        buf[pa:pa + 2], buf[pb:pb + 2] = bytes(buf[pb:pb + 2]), bytes(buf[pa:pa + 2])
+    path.write_bytes(bytes(buf))
+
+    if fix_hash:
+        v = elf_inject._LoaderView(str(path))
+        buf = bytearray(v.buf)
+        ho = v.vaddr_to_off(v.tags[elf_inject._DT_HASH])
+        nbucket, nchain = struct.unpack_from("<II", buf, ho)
+        buckets, chains = ho + 8, ho + 8 + 4 * nbucket
+        names = {k: n for k, n, *_ in elf_inject._dynsym_entries(str(path))}
+        bkt = [0] * nbucket
+        chn = [0] * nchain
+        for k in range(nchain - 1, 0, -1):          # standard prepend construction
+            name = names.get(k)
+            if name is None:
+                continue
+            h = elf_inject._elf_hash(name) % nbucket
+            chn[k], bkt[h] = bkt[h], k
+        struct.pack_into("<%dI" % nbucket, buf, buckets, *bkt)
+        struct.pack_into("<%dI" % nchain, buf, chains, *chn)
+        path.write_bytes(bytes(buf))
+    return path
+
+
+def _assert_equivalent(src, out):
+    elf_inject._assert_dynsyms_equivalent(str(src), str(out), "TEST", "the test would be a lie")
+
+
+def test_permuting_library_is_still_resolution_equivalent(tmp_path):
+    """The regression this whole section exists for: LIEF reorders this table, and the guard must
+    pass anyway because nothing an app can observe changed."""
+    corpus = _corpus()
+    src = corpus.extract(*_PERMUTING, tmp_path)
+
+    kinds = [k for _i, _n, k, *_ in elf_inject._dynsym_entries(str(src))]
+    imports = [i for i, k in enumerate(kinds) if k == elf_inject._SYM_UND]
+    assert imports != list(range(len(imports))), (
+        "this library's .dynsym no longer interleaves imports with exports, so LIEF has nothing "
+        "to normalise and it stops exercising the permutation")
+
+    out = _lief_rewrite(src, tmp_path / "out.so")
+    assert _dynsym_names(str(src)) != _dynsym_names(str(out)), (
+        "LIEF no longer permutes .dynsym on write - the order-insensitive comparison is now "
+        "untested; find another permuting library or drop the tolerance")
+
+    # Spelled out independently of the guard, so this test checks the PROPERTY rather than
+    # re-running the function under test: the symbol from the original skip report is still a
+    # defined 56-byte function, just rebased.
+    delta = elf_inject._rebase_delta(str(src), str(out))
+    a = elf_inject._dynsym_resolution(str(src))
+    b = elf_inject._dynsym_resolution(str(out))
+    assert set(a) == set(b)
+    (kind, val, size, info, ver), = a["call_vm_loadTA"]
+    assert (kind, size) == (elf_inject._SYM_DEF, 56)
+    assert b["call_vm_loadTA"] == ((kind, val + delta, size, info, ver),)
+
+    _assert_equivalent(src, out)                     # must not raise
+
+
+def test_permutation_without_hash_rebuild_is_caught(tmp_path):
+    """A reordered `.dynsym` against stale DT_HASH buckets: the table reads fine and dlsym finds
+    nothing. This is the case the order tolerance could have let through."""
+    corpus = _corpus()
+    src = corpus.extract(*_PERMUTING, tmp_path)
+    out = _lief_rewrite(src, tmp_path / "out.so")
+    # DT_VERSYM moves with the records (it is indexed by symbol index, and check (2) would
+    # otherwise fire on the version mismatch first), so DT_HASH is the only stale table left.
+    _swap_dynsyms(out, *_one_und_and_def(out), fix_versym=True)
+    with pytest.raises(InjectError, match="DT_HASH"):
+        _assert_equivalent(src, out)
+
+
+def test_permutation_without_reloc_fixup_is_caught(tmp_path):
+    """Same swap, with DT_VERSYM and DT_HASH rebuilt - so only the relocations' r_info symbol
+    indices are stale, and only check (4) can see it."""
+    corpus = _corpus()
+    src = corpus.extract(*_PERMUTING, tmp_path)
+    out = _lief_rewrite(src, tmp_path / "out.so")
+    _swap_dynsyms(out, *_one_und_and_def(out), fix_versym=True, fix_hash=True)
+    with pytest.raises(InjectError, match="relocation"):
+        _assert_equivalent(src, out)
+
+
+def test_strtab_desync_on_a_permuting_library_is_still_caught(tmp_path):
+    """§11f itself, on the library whose permutation the guard now tolerates: point the written
+    file's DT_STRTAB bytes back at the PRE-write table and every st_name lands mid-string."""
+    corpus = _corpus()
+    src = corpus.extract(*_PERMUTING, tmp_path)
+    out = _lief_rewrite(src, tmp_path / "out.so")
+    pre = elf_inject._effective_strtab(str(src))
+    v = elf_inject._LoaderView(str(out))
+    base = v.strtab_off()
+    assert v.tags[elf_inject._DT_STRSZ] == len(pre), "table changed size; adjust the mutation"
+    buf = bytearray(v.buf)
+    buf[base:base + len(pre)] = pre
+    (tmp_path / "out.so").write_bytes(bytes(buf))
+    with pytest.raises(InjectError, match="dynamic symbol names"):
+        _assert_equivalent(src, tmp_path / "out.so")
+
+
+@_needs_wb_keygen
+def test_permuting_library_packs_under_wbaes(monkeypatch, tmp_path):
+    """End to end: the library that used to be skipped now injects, and comes out resolving
+    identically."""
+    corpus = _corpus()
+    src = corpus.extract(*_PERMUTING, tmp_path)
+    monkeypatch.setattr(elf_inject, "helper_skeleton_path",
+                        lambda abi: _marked_skeleton(tmp_path))
+    _wire_thin(monkeypatch)
+    out = tmp_path / "out.so"
+    elf_inject.inject_so(str(src), str(out), "arm64-v8a", cipher="wbaes",
+                         target_name=pathlib.Path(_PERMUTING[1]).name)
+    _assert_equivalent(src, out)

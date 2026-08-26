@@ -200,11 +200,14 @@ runs in two modes (`is_thin`) and **the expectations invert** between them.
   must be present in the output. `_self_verify_wbaes` runs per target and structurally cannot
   see this. A pre-existing `libsopk_wb.so` in the input APK is a **fatal** collision, not a
   skip: reusing it would leave every thin helper resolving against a foreign blob.
-- **`_self_verify_wbaes`: dynamic symbol names identical in vs out.** Repointing `DT_STRTAB` at
-  an appended `.dynstr` copy desynced every `st_name` once and shipped a crashing APK (→
-  `ARCHITECTURE.md` §11f). The table must be read back from the **written** file
+- **`_self_verify_wbaes`: every dynamic symbol still resolves to the same symbol.** Repointing
+  `DT_STRTAB` at an appended `.dynstr` copy desynced every `st_name` once and shipped a crashing
+  APK (→ `ARCHITECTURE.md` §11f). The table must be read back from the **written** file
   (`_effective_strtab`), and symbols resolved the way bionic does (`_LoaderView`), never via
-  section headers.
+  section headers. `_assert_dynsyms_equivalent` checks the name **set**, per-name
+  `(kind, st_value - rebase, st_size, st_info, versym)`, `DT_HASH` re-resolution and the
+  symbol-bearing relocation map - deliberately **not** `.dynsym` index order, which LIEF
+  legitimately permutes on some libraries (§11f).
 
 The toolchain requirements these imply (static libc++, `-x c`, `--exclude-libs`,
 `--no-undefined`, `-soname`) are stated once, with their rationale, in **Phase 4** - that is
@@ -828,29 +831,34 @@ paths on either, `.shstrtab` still present; (8) the thin helper is a few KB and 
 diffused into the white-box blob (inside the provider), and each session key ships only in
 its wrapped form.
 
-**(9) The target's exported symbol names must be unchanged.** `inject_so` already refuses to
-pack otherwise, but check it here too - it is the failure that produced a loading-then-crashing
+**(9) Every dynamic symbol must still resolve to the same symbol.** `inject_so` already refuses
+to pack otherwise, but check it here too - it is the failure that produced a loading-then-crashing
 APK, and it is invisible to every other check in this list:
 
 ```bash
 APK="$APK" OUT="$OUT" TGT="$TGT" python3 - <<'PY'
 import zipfile, os, sys
 sys.path.insert(0, ".")
-from sopack.elf_inject import _dynsym_names
+from sopack.elf_inject import InjectError, _assert_dynsyms_equivalent
 TGT = os.environ["TGT"]
 for tag, apk in (("orig", os.environ["APK"]), ("packed", os.environ["OUT"])):
     z = zipfile.ZipFile(apk)
     open(f"/tmp/{tag}_{TGT}", "wb").write(z.read(f"lib/arm64-v8a/{TGT}"))
-a, b = _dynsym_names(f"/tmp/orig_{TGT}"), _dynsym_names(f"/tmp/packed_{TGT}")
-print(f"{len(a)} symbols; PRESERVED: {a == b}")
-if a != b:
-    print("  first diff:", next((x, y) for x, y in zip(a, b) if x != y))
+try:
+    _assert_dynsyms_equivalent(f"/tmp/orig_{TGT}", f"/tmp/packed_{TGT}",
+                               f"packing {TGT}", "dlsym() would fail on device")
+    print("PRESERVED: True")
+except InjectError as e:
+    print("PRESERVED: False\n ", e)
 PY
 ```
 
-Expect `PRESERVED: True`. Note this must be resolved via `DT_STRTAB` (as `_dynsym_names` does),
-not `readelf`'s section-header view - in this mode the two legitimately point at different
-tables, so `readelf --dyn-syms` alone can mislead in either direction.
+Expect `PRESERVED: True`. Do **not** diff `_dynsym_names()` here instead: `.dynsym` index order is
+not an invariant of a write - LIEF normalises the table on some libraries (→
+`ARCHITECTURE.md` §11f) - so that comparison reports failures that are not failures. A benign
+permutation prints a `WARNING:` line from the call above and still passes. Note also that this must
+be resolved via `DT_STRTAB`, not `readelf`'s section-header view: in this mode the two legitimately
+point at different tables, so `readelf --dyn-syms` alone can mislead in either direction.
 
 ---
 

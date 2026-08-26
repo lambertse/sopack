@@ -358,8 +358,10 @@ def _walk_dynsyms(path: str, undefined_only: bool = False,
 
 
 def _dynsym_names(path: str) -> list[str]:
-    """Every dynamic symbol name - pins the invariant that an injection must never change the
-    target's exported symbol names (see `_self_verify_wbaes`)."""
+    """Every dynamic symbol name, in `.dynsym` index order.
+
+    Kept for `_undefined_dynsyms`/`_exported_dynsyms` and for reporting; NOT the injection guard
+    any more. Index order is not an invariant of a write - see `_assert_dynsyms_equivalent`."""
     return _walk_dynsyms(path)
 
 
@@ -373,6 +375,246 @@ def _exported_dynsyms(path: str) -> list[str]:
     """Symbols this `.so` defines for others to resolve. The helper is supposed to export
     nothing; anything here that names the white-box hands an analyst the SDK's API surface."""
     return _walk_dynsyms(path, defined_only=True)
+
+
+# ---- resolution equivalence: what an injection must preserve ----------------------
+# `_dynsym_names` order equality was the original test and it is TOO STRONG. Two things LIEF
+# does on `write()` are legitimate and both change that list:
+#   * it NORMALISES `.dynsym`, moving undefined entries ahead of defined ones. Measured on
+#     `lib/arm64-v8a/libtaInterface.so` of the pinned VSA corpus: 1 of that APK's 24 arm64
+#     libraries permutes, because its table interleaves imports with exports (an obfuscator
+#     artifact). Positional comparison read that as "'call_vm_loadTA' -> '_16923bf24c…L'" and
+#     skipped the library, leaving it in cleartext.
+#   * it REBASES the whole image when the appended segment forces a relayout - measured +4096 on
+#     every defined and SHN_ABS symbol value, on relocation offsets, and on the .dynamic tags,
+#     with undefined values staying 0. So absolute st_value equality is wrong too.
+# What bionic actually needs is that every name still resolves to the SAME symbol, that DT_HASH
+# still finds it, and that no relocation changed which symbol it targets. That is what these read
+# and `_assert_dynsyms_equivalent` asserts - strictly stronger than the old check (§11f's desync
+# garbles st_name reads, so the NAME SET cannot survive it), just not order-sensitive.
+_SYM_UND, _SYM_ABS, _SYM_DEF = "UND", "ABS", "DEF"
+
+
+def _dynsym_entries(path: str) -> list[tuple[int, str, str, int, int, int, int | None]]:
+    """`(index, name, kind, st_value, st_size, st_info, versym)` per NAMED dynamic symbol,
+    resolved the loader's way. `kind` is separate from `st_value` because only `DEF`/`ABS` values
+    are rebased by a write - an `UND` value must stay 0."""
+    v = _LoaderView(path)
+    symtab_va, strtab = v.tags.get(_DT_SYMTAB), v.strtab_off()
+    if symtab_va is None or strtab is None:
+        return []
+    symtab, n = v.vaddr_to_off(symtab_va), v.dynsym_count()
+    if symtab is None or n is None:
+        raise InjectError(
+            f"{os.path.basename(path)} has a DT_SYMTAB whose entry count cannot be determined, "
+            "so its symbols cannot be verified")
+    versym = None
+    if _DT_VERSYM in v.tags:
+        versym = v.vaddr_to_off(v.tags[_DT_VERSYM])
+    ent = 24 if v.is64 else 16
+    out = []
+    for i in range(n):
+        base = symtab + i * ent
+        if v.is64:
+            st_name, st_info, _other, shndx = struct.unpack_from("<IBBH", v.buf, base)
+            st_value, st_size = struct.unpack_from("<QQ", v.buf, base + 8)
+        else:
+            st_name, st_value, st_size = struct.unpack_from("<III", v.buf, base)
+            st_info, _other, shndx = struct.unpack_from("<BBH", v.buf, base + 12)
+        if not st_name:                                      # index 0 is the reserved symbol
+            continue
+        kind = _SYM_UND if shndx == 0 else (_SYM_ABS if shndx == _SHN_ABS else _SYM_DEF)
+        ver = struct.unpack_from("<H", v.buf, versym + 2 * i)[0] if versym is not None else None
+        out.append((i, v.str_at(strtab, st_name), kind, st_value, st_size, st_info, ver))
+    return out
+
+
+def _resolution_of(entries) -> dict[str, tuple[tuple, ...]]:
+    """`{name: sorted tuple of (kind, st_value, st_size, st_info, versym)}` from `_dynsym_entries`.
+
+    A tuple per name, not one entry, because symbol versioning legitimately repeats a name; a
+    plain dict would silently drop one of them and stop guarding it."""
+    per_name: dict[str, list[tuple]] = {}
+    for _i, name, kind, val, size, info, ver in entries:
+        per_name.setdefault(name, []).append((kind, val, size, info, ver))
+    return {n: tuple(sorted(v)) for n, v in per_name.items()}
+
+
+def _dynsym_resolution(path: str) -> dict[str, tuple[tuple, ...]]:
+    """`_resolution_of` for a path - the form callers outside this module want."""
+    return _resolution_of(_dynsym_entries(path))
+
+
+def _elf_hash(name: str) -> int:
+    """The SysV `DT_HASH` function, exactly as bionic computes it."""
+    h = 0
+    for c in name.encode():
+        h = (h * 16 + c) & 0xFFFFFFFF
+        g = h & 0xF0000000
+        if g:
+            h ^= g >> 24
+        h &= ~g & 0xFFFFFFFF
+    return h
+
+
+def _hash_lookup_failures(path: str, entries=None) -> list[str]:
+    """Names `DT_HASH` cannot resolve to their own `.dynsym` index - i.e. what `dlsym` would miss.
+
+    [] when the library has no `DT_HASH` (nothing to be inconsistent with). Deliberately no
+    `DT_GNU_HASH` walk, for the reason `_LoaderView.dynsym_count` refuses one: GNU hash covers
+    only defined exported symbols, so absence there proves nothing."""
+    v = _LoaderView(path)
+    if _DT_HASH not in v.tags:
+        return []
+    ho = v.vaddr_to_off(v.tags[_DT_HASH])
+    if ho is None:
+        return []
+    nbucket, nchain = struct.unpack_from("<II", v.buf, ho)
+    buckets, chains = ho + 8, ho + 8 + 4 * nbucket
+    by_index = {i: name for i, name, *_ in
+                (entries if entries is not None else _dynsym_entries(path))}
+    bad = []
+    for want in set(by_index.values()):
+        i = struct.unpack_from("<I", v.buf, buckets + 4 * (_elf_hash(want) % nbucket))[0]
+        steps = 0
+        # `i < nchain` is a bounds check, not an optimisation: a chain index past the end of the
+        # table is itself corruption, and reading it would walk off the array instead of
+        # reporting it.
+        while i and i < nchain and steps <= nchain:
+            if by_index.get(i) == want:
+                break
+            i = struct.unpack_from("<I", v.buf, chains + 4 * i)[0]
+            steps += 1
+        else:
+            bad.append(want)
+    return sorted(bad)
+
+
+def _reloc_symbol_map(path: str) -> dict[tuple[int, int], tuple[int, str]]:
+    """`{(table_tag, r_offset): (r_type, symbol_name)}` for every SYMBOL-BEARING relocation.
+
+    `R_*_RELATIVE` entries (symbol index 0) are excluded on purpose: they name no symbol, so they
+    cannot express the failure this guards - a `.dynsym` permutation whose `r_info` symbol indices
+    were not renumbered - while their addends are rebased load-relative values that would make
+    this a fresh source of false skips."""
+    v = _LoaderView(path)
+    strtab = v.strtab_off()
+    symtab_va = v.tags.get(_DT_SYMTAB)
+    if strtab is None or symtab_va is None:
+        return {}
+    symtab = v.vaddr_to_off(symtab_va)
+    if symtab is None:
+        return {}
+    sym_ent = 24 if v.is64 else 16
+    tables = [(_DT_RELA, _DT_RELASZ, True), (_DT_REL, _DT_RELSZ, False)]
+    if _DT_JMPREL in v.tags:
+        tables.append((_DT_JMPREL, _DT_PLTRELSZ, v.tags.get(_DT_PLTREL) == _DT_RELA))
+    out: dict[tuple[int, int], tuple[int, str]] = {}
+    for tag, size_tag, is_rela in tables:
+        if tag not in v.tags or size_tag not in v.tags:
+            continue
+        off = v.vaddr_to_off(v.tags[tag])
+        if off is None:
+            continue
+        ent = (24 if is_rela else 16) if v.is64 else (12 if is_rela else 8)
+        for k in range(v.tags[size_tag] // ent):
+            base = off + k * ent
+            if v.is64:
+                r_off, r_info = struct.unpack_from("<QQ", v.buf, base)
+                sym, rtype = r_info >> 32, r_info & 0xFFFFFFFF
+            else:
+                r_off, r_info = struct.unpack_from("<II", v.buf, base)
+                sym, rtype = r_info >> 8, r_info & 0xFF
+            if not sym:
+                continue
+            st_name = struct.unpack_from("<I", v.buf, symtab + sym * sym_ent)[0]
+            out[(tag, r_off)] = (rtype, v.str_at(strtab, st_name) if st_name else "")
+    return out
+
+
+def _rebase_delta(in_path: str, out_path: str) -> int:
+    """How far the write moved the image, read off tags sopack never repoints.
+
+    `DT_SYMTAB` (and `DT_HASH`, cross-checked) rather than `DT_STRTAB`: the wbaes path repoints
+    `DT_STRTAB` at an appended copy on purpose, so its delta says nothing about the rebase."""
+    a, b = _LoaderView(in_path), _LoaderView(out_path)
+    deltas = {}
+    for tag, name in ((_DT_SYMTAB, "DT_SYMTAB"), (_DT_HASH, "DT_HASH")):
+        if tag in a.tags and tag in b.tags:
+            deltas[name] = b.tags[tag] - a.tags[tag]
+    if not deltas:
+        return 0
+    if len(set(deltas.values())) != 1:
+        raise InjectError(
+            f"the write moved {os.path.basename(out_path)}'s dynamic tables by inconsistent "
+            f"amounts ({deltas}) - the image is not a uniform rebase of its input")
+    return next(iter(deltas.values()))
+
+
+def _assert_dynsyms_equivalent(in_path: str, out_path: str, what: str, consequence: str) -> None:
+    """Refuse `out_path` unless every dynamic symbol still resolves to the same thing it did in
+    `in_path`, allowing for a uniform rebase and a `.dynsym` permutation.
+
+    Four checks, ordered so the first failure names the actual defect; then a warning if the order
+    moved but nothing else did. See docs/technical/ARCHITECTURE.md §11f."""
+    delta = _rebase_delta(in_path, out_path)
+    ent_in, ent_out = _dynsym_entries(in_path), _dynsym_entries(out_path)
+    before, after = _resolution_of(ent_in), _resolution_of(ent_out)
+
+    # (1) The name SET. This is where the §11f desync lands: st_name offsets indexing the wrong
+    # table read mid-string, so names come back as fragments and the set cannot match.
+    if set(before) != set(after):
+        lost = sorted(set(before) - set(after))
+        gained = sorted(set(after) - set(before))
+        detail = f"e.g. {lost[0]!r} -> {gained[0]!r}" if lost and gained else \
+                 f"lost {lost[:3]}, gained {gained[:3]}" if (lost or gained) else \
+                 f"count {len(before)} -> {len(after)}"
+        raise InjectError(
+            f"{what} changed the dynamic symbol names ({detail}) - DT_STRTAB and the .dynsym "
+            f"offsets are out of sync, so {consequence}")
+
+    # (2) What each name resolves to, under the measured rebase.
+    def shifted(entries):
+        return tuple(sorted((kind, val + (0 if kind == _SYM_UND else delta), size, info, ver)
+                            for kind, val, size, info, ver in entries))
+
+    for name in sorted(before):
+        want = shifted(before[name])
+        if after[name] != want:
+            raise InjectError(
+                f"{what} changed what {name!r} resolves to ({before[name]} -> {after[name]}, "
+                f"expected {want} after a rebase of {delta:+d}) - {consequence}")
+
+    # (3) DT_HASH must still find every name at its own index: dlsym walks those chains, so a
+    # permuted .dynsym against stale buckets resolves nothing even though the table is intact.
+    bad = _hash_lookup_failures(out_path, ent_out)
+    if bad:
+        raise InjectError(
+            f"{what} left DT_HASH unable to resolve {len(bad)} of its own dynamic symbols "
+            f"(e.g. {bad[0]!r}) - {consequence}")
+
+    # (4) No relocation may change which symbol it targets - the other half of a permutation that
+    # was not renumbered.
+    rel_before = {(tag, off + delta): v for (tag, off), v in _reloc_symbol_map(in_path).items()}
+    rel_after = _reloc_symbol_map(out_path)
+    if rel_before != rel_after:
+        moved = sorted(k for k in set(rel_before) & set(rel_after)
+                       if rel_before[k] != rel_after[k])
+        detail = f"e.g. at 0x{moved[0][1]:x}: {rel_before[moved[0]]} -> {rel_after[moved[0]]}" \
+            if moved else f"count {len(rel_before)} -> {len(rel_after)}"
+        raise InjectError(
+            f"{what} changed the symbol a relocation targets ({detail}) - {consequence}")
+
+    # Consistent, but not identical: say so rather than passing in silence.
+    order_before = [n for _i, n, *_ in ent_in]
+    order_after = [n for _i, n, *_ in ent_out]
+    if order_before != order_after:
+        first = next((i for i, (x, y) in enumerate(zip(order_before, order_after)) if x != y),
+                     len(order_before))
+        _warn(f"{what} came out with .dynsym in a different ORDER (first at index {first}: "
+              f"{order_before[first]!r} -> {order_after[first]!r}) - LIEF normalises the table on "
+              "write. Every name still resolves identically, DT_HASH still finds each one, and no "
+              "relocation changed target, so this is benign; see ARCHITECTURE.md §11f.")
 
 
 # Sections the loader never maps, so the helper has no business shipping them. This is NOT the
@@ -709,12 +951,12 @@ def _emit_wbaes_artifact(skeleton: str, region_bytes: bytes, out_path: str,
     it here would silently break all of them."""
     name = os.path.basename(skeleton)
 
-    # Snapshot before any write. LIEF rebuilds .dynstr with the strings SORTED on write(),
-    # rewriting every st_name to match; on the target that desync shipped once and cost a Flutter
-    # app its Dart snapshot pointers (§11f). Here it would silently break the undefined/exported
-    # symbol guards above - and, for the provider, the exported name a thin helper resolves by
-    # string.
-    dynsyms_before = _dynsym_names(skeleton)
+    # The symbol comparison at the end of this function reads `skeleton` directly - it is
+    # untouched by everything below (the strip and the append both work on `out_path`), so there
+    # is nothing to snapshot. LIEF rebuilds .dynstr with the strings SORTED on write(), rewriting
+    # every st_name to match; on the target that desync shipped once and cost a Flutter app its
+    # Dart snapshot pointers (§11f). Here it would silently break the undefined/exported symbol
+    # guards above - and, for the provider, the exported name a thin helper resolves by string.
 
     # Strip FIRST, on a copy, and only then let LIEF append the region. The order matters twice:
     #   * LIEF re-creates `.symtab`/`.strtab` from its own symbol model on write(), so stripping
@@ -752,16 +994,10 @@ def _emit_wbaes_artifact(skeleton: str, region_bytes: bytes, out_path: str,
     binary.add(seg)
     binary.write(out_path)
 
-    dynsyms_after = _dynsym_names(out_path)
-    if dynsyms_before != dynsyms_after:
-        bad = next(((x, y) for x, y in zip(dynsyms_before, dynsyms_after) if x != y), None)
-        detail = f"e.g. {bad[0]!r} -> {bad[1]!r}" if bad else \
-                 f"count {len(dynsyms_before)} -> {len(dynsyms_after)}"
-        raise InjectError(
-            f"emitting {kind} {os.path.basename(out_path)} changed its dynamic symbol names "
-            f"({detail}) - DT_STRTAB and the .dynsym offsets are out of sync, so the "
-            "undefined/exported symbol guards no longer inspect what they claim to, and bionic "
-            "may fail to resolve between the helper and the provider")
+    _assert_dynsyms_equivalent(
+        skeleton, out_path, f"emitting {kind} {os.path.basename(out_path)}",
+        "the undefined/exported symbol guards no longer inspect what they claim to, and bionic "
+        "may fail to resolve between the helper and the provider")
 
     # Residual host paths. After the strip there should be none; anything left is in a mapped
     # section, which no amount of post-processing here can fix - it needs the archive rebuilt
@@ -943,17 +1179,12 @@ def _self_verify_wbaes(target_path, helper_path, ciphertext, text_rva, text_size
     # (b) DT_NEEDED points at the helper - resolved via DT_STRTAB, as the loader does.
     if helper_soname not in _needed_via_strtab(target_path):
         raise InjectError(f"DT_NEEDED {helper_soname!r} missing from target")
-    # (b2) EVERY existing exported symbol name still resolves to the same string. A mismatch
-    # means dlsym() returns the wrong name or NULL - an APK that loads and then crashes far
-    # from the cause. Cheap check; see docs/technical/ARCHITECTURE.md §11f for the incident.
-    before, after = _dynsym_names(in_path), _dynsym_names(target_path)
-    if before != after:
-        bad = next(((x, y) for x, y in zip(before, after) if x != y), None)
-        detail = f"e.g. {bad[0]!r} -> {bad[1]!r}" if bad else \
-                 f"count {len(before)} -> {len(after)}"
-        raise InjectError(
-            f"injection changed the target's dynamic symbol names ({detail}) - DT_STRTAB and "
-            "the .dynsym offsets are out of sync, so dlsym() would fail on device")
+    # (b2) EVERY existing dynamic symbol still resolves to the same symbol. A mismatch means
+    # dlsym() returns the wrong address or NULL - an APK that loads and then crashes far from
+    # the cause. See docs/technical/ARCHITECTURE.md §11f for the incident, and
+    # `_assert_dynsyms_equivalent` for why this is not an order comparison.
+    _assert_dynsyms_equivalent(in_path, target_path, "injecting the target",
+                               "dlsym() would fail on device")
     # (c) 16 KB congruence for arm64 (the only 16 KB-page device class) + no text relocs.
     _assert_16k_and_no_textrel(tgt, abi, orig_path=in_path,
                                what=f"the packed target {target_soname}")
@@ -1324,6 +1555,12 @@ def inject_so(in_path: str, out_path: str, abi: str,
 _DT_NULL, _DT_INIT, _SHT_DYNAMIC, _PT_DYNAMIC, _PT_LOAD = 0, 12, 6, 2, 1
 _DT_NEEDED, _DT_STRTAB, _DT_STRSZ = 1, 5, 10
 _DT_HASH, _DT_SYMTAB, _SHT_DYNSYM = 4, 6, 11
+# The relocation tables, their sizes, and symbol versioning - read by _reloc_symbol_map and
+# _dynsym_resolution, which together decide whether a permuted .dynsym is self-consistent.
+_DT_RELA, _DT_RELASZ, _DT_REL, _DT_RELSZ = 7, 8, 17, 18
+_DT_JMPREL, _DT_PLTRELSZ, _DT_PLTREL = 23, 2, 20
+_DT_VERSYM = 0x6FFFFFF0
+_SHN_ABS = 0xFFF1
 
 
 def _add_needed_inplace(path: str, name_off: int, new_strtab_vaddr: int,
